@@ -6,7 +6,7 @@ from .scanner import *
 from .parser import *
 from .composer import *
 from .constructor import *
-from .resolver_temp import *
+from .resolver import *
 
 class BaseLoader(Reader, Scanner, Parser, Composer, BaseConstructor, BaseResolver):
 
