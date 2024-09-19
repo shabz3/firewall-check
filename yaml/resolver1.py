@@ -1,3 +1,4 @@
+
 __all__ = ['BaseResolver', 'Resolver']
 
 from .error import *
@@ -109,3 +110,4 @@ class BaseResolver:
                     prefix_paths.append((path, kind))
         self.resolver_exact_paths.append(exact_paths)
         self.resolver_prefix_paths.append(prefix_paths)
+

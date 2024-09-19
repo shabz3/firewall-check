@@ -1,4 +1,3 @@
-
     def ascend_resolver(self):
         if not self.yaml_path_resolvers:
             return
@@ -112,3 +111,4 @@ Resolver.add_implicit_resolver(
         'tag:yaml.org,2002:yaml',
         re.compile(r'^(?:!|&|\*)$'),
         list('!&*'))
+
