@@ -4,7 +4,7 @@ __all__ = ['BaseDumper', 'SafeDumper', 'Dumper']
 from .emitter import *
 from .serializer import *
 from .representer import *
-from .resolver import *
+from .resolver_temp import *
 
 class BaseDumper(Emitter, Serializer, BaseRepresenter, BaseResolver):
 

@@ -11,7 +11,7 @@ from .constructor import *
 from .serializer import *
 from .representer import *
 
-from .resolver import *
+from .resolver_temp import *
 
 class CBaseLoader(CParser, BaseConstructor, BaseResolver):
 
