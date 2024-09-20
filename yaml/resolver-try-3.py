@@ -19,3 +19,5 @@ class BaseResolver:
     yaml_path_resolvers = {}
 
     def __init__(self):
+        self.resolver_exact_paths = []
+
