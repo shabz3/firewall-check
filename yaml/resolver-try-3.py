@@ -20,5 +20,4 @@ class BaseResolver:
 
     def __init__(self):
         self.resolver_exact_paths = []
-        self.resolver_prefix_paths = []
 
