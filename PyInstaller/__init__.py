@@ -18,7 +18,7 @@ from PyInstaller import compat
 from PyInstaller.utils.git import get_repo_revision
 
 # Note: Keep this variable as plain string so it could be updated automatically when doing a release.
-__version__ = '5.11.0'
+__version__ = '6.9.0'
 
 # Absolute path of this package's directory. Save this early so all submodules can use the absolute path. This is
 # required for example if the current directory changes prior to loading the hooks.
@@ -42,9 +42,8 @@ if os.path.exists(os.path.join(HOMEPATH, 'setup.py')):
             sys.stderr.write('WARN: failed to parse git revision')
 else:
     # PyInstaller was installed by `python setup.py install'.
-    import pkg_resources
-    __version__ = pkg_resources.get_distribution('PyInstaller').version
-
+    from importlib.metadata import version
+    __version__ = version('PyInstaller')
 # Default values of paths where to put files created by PyInstaller. If changing these, do not forget to update the
 # help text for corresponding command-line options, defined in build_main.
 

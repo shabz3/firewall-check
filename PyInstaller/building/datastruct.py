@@ -310,7 +310,9 @@ def normalize_toc(toc):
     # Default priority: 0
     _TOC_TYPE_PRIORITIES = {
         # DEPENDENCY entries need to replace original entries, so they need the highest priority.
-        'DEPENDENCY': 2,
+        'DEPENDENCY': 3,
+        # SYMLINK entries have higher priority than other regular entries
+        'SYMLINK': 2,
         # BINARY/EXTENSION entries undergo additional processing, so give them precedence over DATA and other entries.
         'BINARY': 1,
         'EXTENSION': 1,
@@ -328,16 +330,24 @@ def normalize_toc(toc):
 def normalize_pyz_toc(toc):
     # Default priority: 0
     _TOC_TYPE_PRIORITIES = {
-        # Ensure that modules are never shadowed by PYZ-embedded data files.
-        'PYMODULE': 1,
+        # Ensure that entries with higher optimization level take precedence.
+        'PYMODULE-2': 2,
+        'PYMODULE-1': 1,
+        'PYMODULE': 0,
     }
 
     return _normalize_toc(toc, _TOC_TYPE_PRIORITIES)
 
 
 def _normalize_toc(toc, toc_type_priorities, type_case_normalization_fcn=lambda typecode: False):
+    options_toc = []
     tmp_toc = dict()
     for dest_name, src_name, typecode in toc:
+        # Exempt OPTION entries from de-duplication processing. Some options might allow being specified multiple times.
+        if typecode == 'OPTION':
+            options_toc.append(((dest_name, src_name, typecode)))
+            continue
+
         # Always sanitize the dest_name with `os.path.normpath` to remove any local loops with parent directory path
         # components. `pathlib` does not seem to offer equivalent functionality.
         dest_name = os.path.normpath(dest_name)
@@ -360,4 +370,90 @@ def _normalize_toc(toc, toc_type_priorities, type_case_normalization_fcn=lambda 
                 tmp_toc[entry_key] = (dest_name, src_name, typecode)
 
     # Return the items as list. The order matches the original order due to python dict maintaining the insertion order.
-    return list(tmp_toc.values())
+    # The exception are OPTION entries, which are now placed at the beginning of the TOC.
+    return options_toc + list(tmp_toc.values())
+
+
+def toc_process_symbolic_links(toc):
+    """
+    Process TOC entries and replace entries whose files are symbolic links with SYMLINK entries (provided original file
+    is also being collected).
+    """
+    # Dictionary of all destination names, for a fast look-up.
+    all_dest_files = set([dest_name for dest_name, src_name, typecode in toc])
+
+    # Process the TOC to create SYMLINK entries
+    new_toc = []
+    for entry in toc:
+        dest_name, src_name, typecode = entry
+
+        # Skip entries that are already symbolic links
+        if typecode == 'SYMLINK':
+            new_toc.append(entry)
+            continue
+
+        # Skip entries without valid source name (e.g., OPTION)
+        if not src_name:
+            new_toc.append(entry)
+            continue
+
+        # Source path is not a symbolic link (i.e., it is a regular file or directory)
+        if not os.path.islink(src_name):
+            new_toc.append(entry)
+            continue
+
+        # Try preserving the symbolic link, under strict relative-relationship-preservation check
+        symlink_entry = _try_preserving_symbolic_link(dest_name, src_name, all_dest_files)
+
+        if symlink_entry:
+            new_toc.append(symlink_entry)
+        else:
+            new_toc.append(entry)
+
+    return new_toc
+
+
+def _try_preserving_symbolic_link(dest_name, src_name, all_dest_files):
+    seen_src_files = set()
+
+    # Set initial values for the loop
+    ref_src_file = src_name
+    ref_dest_file = dest_name
+
+    while True:
+        # Guard against cyclic links...
+        if ref_src_file in seen_src_files:
+            break
+        seen_src_files.add(ref_src_file)
+
+        # Stop when referenced source file is not a symbolic link anymore.
+        if not os.path.islink(ref_src_file):
+            break
+
+        # Read the symbolic link's target, but do not fully resolve it using os.path.realpath(), because there might be
+        # other symbolic links involved as well (for example, /lib64 -> /usr/lib64 whereas we are processing
+        # /lib64/liba.so -> /lib64/liba.so.1)
+        symlink_target = os.readlink(ref_src_file)
+        if os.path.isabs(symlink_target):
+            break  # We support only relative symbolic links.
+
+        ref_dest_file = os.path.join(os.path.dirname(ref_dest_file), symlink_target)
+        ref_dest_file = os.path.normpath(ref_dest_file)  # remove any '..'
+
+        ref_src_file = os.path.join(os.path.dirname(ref_src_file), symlink_target)
+        ref_src_file = os.path.normpath(ref_src_file)  # remove any '..'
+
+        # Check if referenced destination file is valid (i.e., we are collecting a file under referenced name).
+        if ref_dest_file in all_dest_files:
+            # Sanity check: original source name and current referenced source name must, after complete resolution,
+            # point to the same file.
+            if os.path.realpath(src_name) == os.path.realpath(ref_src_file):
+                # Compute relative link for the destination file (might be modified, if we went over non-collected
+                # intermediate links).
+                rel_link = os.path.relpath(ref_dest_file, os.path.dirname(dest_name))
+                return dest_name, rel_link, 'SYMLINK'
+
+        # If referenced destination is not valid, do another iteration in case we are dealing with chained links and we
+        # are not collecting an intermediate link...
+
+    return None

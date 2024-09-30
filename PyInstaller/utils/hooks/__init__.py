@@ -13,22 +13,21 @@ from __future__ import annotations
 
 import copy
 import os
-import sys
+import subprocess
 import textwrap
 import fnmatch
 from pathlib import Path
 from collections import deque
 from typing import Callable
 
-import pkg_resources
+import packaging.requirements
 
 from PyInstaller import HOMEPATH, compat
 from PyInstaller import log as logging
 from PyInstaller.depend.imphookapi import PostGraphAPI
 from PyInstaller.exceptions import ExecCommandFailed
-from PyInstaller.utils.hooks.win32 import \
-    get_pywin32_module_file_attribute  # noqa: F401
 from PyInstaller import isolated
+from PyInstaller.compat import importlib_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -303,35 +302,37 @@ def get_module_file_attribute(package: str):
     str
         Absolute path of this module.
     """
-    # First, try to use 'pkgutil'. It is the fastest way, but does not work on certain modules in pywin32 that replace
-    # all module attributes with those of the .dll. In addition, we need to avoid it for submodules/subpackages,
-    # because it ends up importing their parent package, which would cause an import leak during the analysis.
+    # First, try to use 'importlib.util.find_spec' and obtain loader from the spec (and filename from the loader).
+    # It is the fastest way, but does not work on certain modules in pywin32 that replace all module attributes with
+    # those of the .dll. In addition, we need to avoid it for submodules/subpackages, because it ends up importing
+    # their parent package, which would cause an import leak during the analysis.
     filename: str | None = None
     if '.' not in package:
         try:
-            import pkgutil
-            loader = pkgutil.find_loader(package)
+            import importlib.util
+            loader = importlib.util.find_spec(package).loader
             filename = loader.get_filename(package)
             # Apparently in the past, ``None`` could be returned for built-in ``datetime`` module. Just in case this
             # is still possible, return only if filename is valid.
             if filename:
                 return filename
-        except (AttributeError, ImportError):
+        except (ImportError, AttributeError, TypeError, ValueError):
             pass
 
     # Second attempt: try to obtain module/package's __file__ attribute in an isolated subprocess.
     @isolated.decorate
     def _get_module_file_attribute(package):
-        # First try to use 'pkgutil'; it returns the filename even if the module or package cannot be imported
-        # (e.g., C-extension module with missing dependencies).
+        # First, try to use 'importlib.util.find_spec' and obtain loader from the spec (and filename from the loader).
+        # This should return the filename even if the module or package cannot be imported (e.g., a C-extension module
+        # with missing dependencies).
         try:
-            import pkgutil
-            loader = pkgutil.find_loader(package)
+            import importlib.util
+            loader = importlib.util.find_spec(package).loader
             filename = loader.get_filename(package)
             # Safe-guard against ``None`` being returned (see comment in the non-isolated codepath).
             if filename:
                 return filename
-        except (AttributeError, ImportError):
+        except (ImportError, AttributeError, TypeError, ValueError):
             pass
 
         # Fall back to import attempt
@@ -348,110 +349,110 @@ def get_module_file_attribute(package: str):
     return filename
 
 
-def is_module_satisfies(
-    requirements: list | pkg_resources.Requirement,
-    version: str | pkg_resources.Distribution | None = None,
-    version_attr: str = "__version__",
-):
+def get_pywin32_module_file_attribute(module_name):
     """
-    Test if a :pep:`0440` requirement is installed.
+    Get the absolute path of the PyWin32 DLL specific to the PyWin32 module with the passed name (`pythoncom`
+    or `pywintypes`).
+
+    On import, each PyWin32 module:
+
+    * Imports a DLL specific to that module.
+    * Overwrites the values of all module attributes with values specific to that DLL. This includes that module's
+      `__file__` attribute, which then provides the absolute path of that DLL.
+
+    This function imports the module in isolated subprocess and retrieves its `__file__` attribute.
+    """
+
+    # NOTE: we cannot use `get_module_file_attribute` as it does not account for the  __file__ rewriting magic
+    # done by the module. Use `get_module_attribute` instead.
+    return get_module_attribute(module_name, '__file__')
+
+
+def check_requirement(requirement: str):
+    """
+    Check if a :pep:`0508` requirement is satisfied. Usually used to check if a package distribution is installed,
+    or if it is installed and satisfies the specified version requirement.
 
     Parameters
     ----------
-    requirements : str
-        Requirements in `pkg_resources.Requirements.parse()` format.
-    version : str
-        Optional PEP 0440-compliant version (e.g., `3.14-rc5`) to be used _instead_ of the current version of this
-        module. If non-`None`, this function ignores all `setuptools` distributions for this module and instead
-        compares this version against the version embedded in the passed requirements. This ignores the module name
-        embedded in the passed requirements, permitting arbitrary versions to be compared in a robust manner.
-        See examples below.
-    version_attr : str
-        Optional name of the version attribute defined by this module, defaulting to `__version__`. If a
-        `setuptools` distribution exists for this module (it usually does) _and_ the `version` parameter is `None`
-        (it usually is), this parameter is ignored.
+    requirement : str
+        Requirement string in :pep:`0508` format.
 
     Returns
     ----------
     bool
-        Boolean result of the desired validation.
-
-    Raises
-    ----------
-    AttributeError
-        If no `setuptools` distribution exists for this module _and_ this module defines no attribute whose name is the
-        passed `version_attr` parameter.
-    ValueError
-        If the passed specification does _not_ comply with `pkg_resources.Requirements`_ syntax.
+        Boolean indicating whether the requirement is satisfied or not.
 
     Examples
     --------
 
     ::
 
-        # Assume PIL 2.9.0, Sphinx 1.3.1, and SQLAlchemy 0.6 are all installed.
-        >>> from PyInstaller.utils.hooks import is_module_satisfies
-        >>> is_module_satisfies('sphinx >= 1.3.1')
+        # Assume Pillow 10.0.0 is installed.
+        >>> from PyInstaller.utils.hooks import check_requirement
+        >>> check_requirement('Pillow')
         True
-        >>> is_module_satisfies('sqlalchemy != 0.6')
+        >>> check_requirement('Pillow < 9.0')
         False
-
-        >>> is_module_satisfies('sphinx >= 1.3.1; sqlalchemy != 0.6')
-        False
-
-
-        # Compare two arbitrary versions. In this case, the module name "sqlalchemy" is simply ignored.
-        >>> is_module_satisfies('sqlalchemy != 0.6', version='0.5')
+        >>> check_requirement('Pillow >= 9.0, < 11.0')
         True
-
-        # Since the "pillow" project providing PIL publishes its version via the custom "PILLOW_VERSION" attribute
-        # (rather than the standard "__version__" attribute), an attribute name is passed as a fallback to validate PIL
-        # when not installed by setuptools. As PIL is usually installed by setuptools, this optional parameter is
-        # usually ignored.
-        >>> is_module_satisfies('PIL == 2.9.0', version_attr='PILLOW_VERSION')
-        True
-
-    .. seealso::
-
-        `pkg_resources.Requirements`_ for the syntax details.
-
-    .. _`pkg_resources.Requirements`:
-            https://pythonhosted.org/setuptools/pkg_resources.html#id12
     """
-    # If no version was explicitly passed...
-    if version is None:
-        # If a setuptools distribution exists for this module, this validation is a simple one-liner. This approach
-        # supports non-version validation (e.g., of "["- and "]"-delimited extras) and is hence preferable.
-        try:
-            pkg_resources.get_distribution(requirements)
-        # If no such distribution exists, fall back to the logic below.
-        except pkg_resources.DistributionNotFound:
-            pass
-        # If all existing distributions violate these requirements, fail.
-        except (pkg_resources.UnknownExtra, pkg_resources.VersionConflict):
-            return False
-        # Else, an existing distribution satisfies these requirements. Win!
-        else:
-            return True
+    parsed_requirement = packaging.requirements.Requirement(requirement)
 
-    # Either a module version was explicitly passed or no setuptools distribution exists for this module. First, parse a
-    # setuptools "Requirements" object from this requirements string.
-    requirements_parsed = pkg_resources.Requirement.parse(requirements)
+    # Fetch the actual version of the specified dist
+    try:
+        version = importlib_metadata.version(parsed_requirement.name)
+    except importlib_metadata.PackageNotFoundError:
+        return False  # Not available at all
 
-    # If no version was explicitly passed, query this module for it.
-    if version is None:
-        module_name = requirements_parsed.project_name
-        if can_import_module(module_name):
-            version = get_module_attribute(module_name, version_attr)
-        else:
-            version = None
+    # If specifier is not given, the only requirement is that dist is available
+    if not parsed_requirement.specifier:
+        return True
 
-    if not version:
-        # Module does not exist in the system.
-        return False
-    else:
-        # Compare this version against the one parsed from the requirements.
-        return version in requirements_parsed
+    # Parse specifier, and compare version. Enable pre-release matching,
+    # because we need "package >= 2.0.0" to match "2.5.0b1".
+    return parsed_requirement.specifier.contains(version, prereleases=True)
+
+
+# Keep the `is_module_satisfies` as an alias for backwards compatibility with existing hooks. The old fallback
+# to module version check does not work any more, though.
+def is_module_satisfies(
+    requirements: str,
+    version: None = None,
+    version_attr: None = None,
+):
+    """
+    A compatibility wrapper for :func:`check_requirement`, intended for backwards compatibility with existing hooks.
+
+    In contrast to original implementation from PyInstaller < 6, this implementation only checks the specified
+    :pep:`0508` requirement string; i.e., it tries to retrieve the distribution metadata, and compare its version
+    against optional version specifier(s). It does not attempt to fall back to checking the module's version attribute,
+    nor does it support ``version`` and ``version_attr`` arguments.
+
+    Parameters
+    ----------
+    requirements : str
+        Requirements string passed to the :func:`check_requirement`.
+    version : None
+        Deprecated and unsupported. Must be ``None``.
+    version_attr : None
+        Deprecated and unsupported. Must be ``None``.
+
+    Returns
+    ----------
+    bool
+        Boolean indicating whether the requirement is satisfied or not.
+
+    Raises
+    ----------
+    ValueError
+        If either ``version`` or ``version_attr`` are specified and are not None.
+    """
+    if version is not None:
+        raise ValueError("Calling is_module_satisfies with version argument is not supported anymore.")
+    if version_attr is not None:
+        raise ValueError("Calling is_module_satisfies with version argument_attr is not supported anymore.")
+    return check_requirement(requirements)
 
 
 def is_package(module_name: str):
@@ -707,7 +708,7 @@ PY_DYLIB_PATTERNS = [
 ]
 
 
-def collect_dynamic_libs(package: str, destdir: str | None = None, search_patterns: [str] = PY_DYLIB_PATTERNS):
+def collect_dynamic_libs(package: str, destdir: str | None = None, search_patterns: list = PY_DYLIB_PATTERNS):
     """
     This function produces a list of (source, dest) of dynamic library files that reside in package. Its output can be
     directly assigned to ``binaries`` in a hook script. The package parameter must be a string which names the package.
@@ -757,15 +758,22 @@ def collect_data_files(
     includes: list | None = None,
 ):
     r"""
-    This function produces a list of ``(source, dest)`` non-Python (i.e., data) files that reside in ``package``.
+    This function produces a list of ``(source, dest)`` entries for data files that reside in ``package``.
     Its output can be directly assigned to ``datas`` in a hook script; for example, see ``hook-sphinx.py``.
+    The data files are all files that are not shared libraries / binary python extensions (based on extension
+    check) and are not python source (.py) files or byte-compiled modules (.pyc). Collection of the .py and .pyc
+    files can be toggled via the ``include_py_files`` flag.
     Parameters:
 
     -   The ``package`` parameter is a string which names the package.
-    -   By default, all Python executable files (those ending in ``.py``, ``.pyc``, and so on) will NOT be collected;
-        setting the ``include_py_files`` argument to ``True`` collects these files as well. This is typically used with
-        Python functions (such as those in ``pkgutil``) that search a given directory for Python executable files and
-        load them as extensions or plugins.
+    -   By default, python source files and byte-compiled modules (files with ``.py`` and ``.pyc`` suffix) are not
+        collected; setting the ``include_py_files`` argument to ``True`` collects these files as well. This is typically
+        used when a package requires source .py files to be available; for example, JIT compilation used in
+        deep-learning frameworks, code that requires access to .py files (for example, to check their date), or code
+        that tries to extend `sys.path` with subpackage paths in a way that is incompatible with PyInstaller's frozen
+        importer.. However, in contemporary PyInstaller versions, the preferred way of collecting source .py files is by
+        using the **module collection mode** setting (which enables collection of source .py files in addition to or
+        in lieu of collecting byte-compiled modules into PYZ archive).
     -   The ``subdir`` argument gives a subdirectory relative to ``package`` to search, which is helpful when submodules
         are imported at run-time from a directory lacking ``__init__.py``.
     -   The ``excludes`` argument contains a sequence of strings or Paths. These provide a list of
@@ -803,10 +811,12 @@ def collect_data_files(
     # do not modify ``excludes_len``.
     if not include_py_files:
         excludes += ['**/*' + s for s in compat.ALL_SUFFIXES]
+    else:
+        # include_py_files should collect only .py and .pyc files, and not the extensions / shared libs.
+        excludes += ['**/*' + s for s in compat.ALL_SUFFIXES if s not in {'.py', '.pyc'}]
 
-    # Exclude .pyo files if include_py_files is False.
-    if not include_py_files and ".pyo" not in compat.ALL_SUFFIXES:
-        excludes.append('**/*.pyo')
+    # Never, ever, collect .pyc files from __pycache__.
+    excludes.append('**/__pycache__/*.pyc')
 
     # If not specified, include all files. Follow the same process as the excludes.
     includes = list(includes) if includes else ["**/*"]
@@ -887,7 +897,8 @@ def collect_system_data_files(path: str, destdir: str | os.PathLike | None = Non
 
 def copy_metadata(package_name: str, recursive: bool = False):
     """
-    Collect distribution metadata so that ``pkg_resources.get_distribution()`` can find it.
+    Collect distribution metadata so that ``importlib.metadata.distribution()`` or ``pkg_resources.get_distribution()``
+    can find it.
 
     This function returns a list to be assigned to the ``datas`` global variable. This list instructs PyInstaller to
     copy the metadata for the given package to the frozen application's data directory.
@@ -898,7 +909,8 @@ def copy_metadata(package_name: str, recursive: bool = False):
         Specifies the name of the package for which metadata should be copied.
     recursive : bool
         If true, collect metadata for the package's dependencies too. This enables use of
-        ``pkg_resources.require('package')`` inside the frozen application.
+        ``importlib.metadata.requires('package')`` or ``pkg_resources.require('package')`` inside the frozen
+        application.
 
     Returns
     -------
@@ -913,11 +925,14 @@ def copy_metadata(package_name: str, recursive: bool = False):
           'Sphinx-1.3.2.dist-info')]
 
 
-    Some packages rely on metadata files accessed through the ``pkg_resources`` module. Normally PyInstaller does not
-    include these metadata files. If a package fails without them, you can use this function in a hook file to easily
-    add them to the frozen bundle. The tuples in the returned list have two strings. The first is the full pathname to a
-    folder in this system. The second is the folder name only. When these tuples are added to ``datas``\\ , the folder
-    will be bundled at the top level.
+    Some packages rely on metadata files accessed through the ``importlib.metadata`` (or the now-deprecated
+    ``pkg_resources``) module. PyInstaller does not collect these metadata files by default.
+    If a package fails without the metadata (either its own, or of another package that it depends on), you can use this
+    function in a hook to collect the corresponding metadata files into the frozen application. The tuples in the
+    returned list contain two strings. The first is the full path to the package's metadata directory on the system. The
+    second is the destination name, which typically corresponds to the basename of the metadata directory. Adding these
+    tuples the the ``datas`` hook global variable, the metadata is collected into top-level application directory (where
+    it is usually searched for).
 
     .. versionchanged:: 4.3.1
 
@@ -939,116 +954,84 @@ def copy_metadata(package_name: str, recursive: bool = False):
         if package_name in done:
             continue
 
-        dist = pkg_resources.get_distribution(package_name)
-        if dist.egg_info is not None:
-            # If available, dist.egg_info points to the source .egg-info or .dist-info directory.
-            dest = _copy_metadata_dest(dist.egg_info, dist.project_name)
-            out.append((dist.egg_info, dest))
-        else:
-            # When .egg-info is not a directory but a single file, dist.egg_info is None, and we need to resolve the
-            # path ourselves. This format is common on Ubuntu/Debian with their deb-packaged python packages.
-            dist_src = _resolve_legacy_metadata_path(dist)
-            if dist_src is None:
+        dist = importlib_metadata.distribution(package_name)
+
+        # We support only `importlib_metadata.PathDistribution`, since we need to rely on its private `_path` attribute
+        # to obtain the path to metadata file/directory. But we need to account for possible sub-classes and vendored
+        # variants (`setuptools._vendor.importlib_metadata.PathDistribution˙), so just check that `_path` is available.
+        if not hasattr(dist, '_path'):
+            raise RuntimeError(
+                f"Unsupported distribution type {type(dist)} for {package_name} - does not have _path attribute"
+            )
+        src_path = dist._path
+
+        # We expect the `_path` attribute to be an instance of `pathlib.Path`. This assumption is violated when the
+        # package happens to be installed as a zipped egg. In such case, `_path` is an instance of either `zipp.Path`
+        # (when using `importlib.metadata` from `importlib-metadata`, which in turn uses 3rd party `zipp` package) or
+        # `zipfile.Path` (when using stdlib's `importlib.metadata`). While we could attempt to read the metadata
+        # from the zip, we dropped geberal support for zipped eggs from PyInstaller in 6.0, so raise an error.
+        if not isinstance(src_path, Path):
+            # NOTE: `src_path.parent` is also an instance of `zipfile.Path` or `zipp.Path`, and calling its `is_file()`
+            # method returns False, because the root of zip file is (rightfully) considered a directory. Therefore, we
+            # convert the path to `pathlib.Path˙ by taking the parent of `src_path.parent` (which turns out to be a
+            # `pathlib.Path`) and add to it the name of the `src_path.parent` (the name of .egg file).
+            try:
+                src_parent = src_path.parent.parent / src_path.parent.name
+            except Exception:
+                src_parent = src_path.parent
+
+            if src_parent.is_file() and src_parent.name.endswith('.egg'):
                 raise RuntimeError(
-                    f"No metadata path found for distribution '{dist.project_name}' (legacy fallback search failed)."
+                    f"Cannot collect metadata from path {str(src_path)!r}, which appears to be inside a zipped egg. "
+                    f"PyInstaller >= 6.0 does not support zipped eggs anymore. Please reinstall {package_name!r} "
+                    "using modern package installation method instead of deprecated 'python setup.py install'. "
+                    "For example, if you are using pip package manager:\n"
+                    "1. uninstall the zipped egg:\n"
+                    f"  pip uninstall {package_name}\n"
+                    "2. make sure pip and its dependencies are up-to-date:\n"
+                    "  python -m pip install --upgrade pip wheel setuptools\n"
+                    "3. install the package:\n"
+                    f"  pip install {package_name}\n"
+                    "To install a package from source, pass the path to the source directory to 'pip install' command."
                 )
-            out.append((dist_src, '.'))  # It is a file, so dest path needs to be '.'
+            else:
+                # Generic message for unforeseen cases.
+                raise RuntimeError(
+                    f"Cannot collect metadata from path {src_path!r}, which is of unsupported type {type(src_path)}."
+                )
+
+        if src_path.is_dir():
+            # The metadata is stored in a directory (.egg-info, .dist-info), so collect the whole directory. If the
+            # package is installed as an egg, the metadata directory is ([...]/package_name-version.egg/EGG-INFO),
+            # and requires special handling (as of PyInstaller v6, we support only non-zipped eggs).
+            if src_path.name == 'EGG-INFO' and src_path.parent.name.endswith('.egg'):
+                dest_path = os.path.join(*src_path.parts[-2:])
+            else:
+                dest_path = src_path.name
+        elif src_path.is_file():
+            # The metadata is stored in a single file. Collect it into top-level application directory.
+            # The .egg-info file is commonly used by Debian/Ubuntu when packaging python packages.
+            dest_path = '.'
+        else:
+            raise RuntimeError(
+                f"Distribution metadata path {src_path!r} for {package_name} is neither file nor directory!"
+            )
+
+        out.append((str(src_path), str(dest_path)))
 
         if not recursive:
             return out
         done.add(package_name)
-        todo.extend(i.project_name for i in dist.requires())
+
+        # Process requirements; `importlib.metadata` has no API for parsing requirements, so we need to use
+        # `packaging.requirements`. This is necessary to discard requirements with markers that do not match the
+        # environment (e.g., `python_version`, `sys_platform`).
+        requirements = [packaging.requirements.Requirement(req) for req in dist.requires or []]
+        requirements = [req.name for req in requirements if req.marker is None or req.marker.evaluate()]
+
+        todo += requirements
 
     return out
-
-
-def _normalise_dist(name: str) -> str:
-    return name.lower().replace("_", "-")
-
-
-def _resolve_legacy_metadata_path(dist):
-    """
-    Attempt to resolve the legacy metadata file for the given distribution.
-    The .egg-info file is commonly used by Debian/Ubuntu when packaging python packages.
-
-    Args:
-        dist:
-            The distribution information as returned by ``pkg_resources.get_distribution("xyz")``.
-    Returns:
-        The path to the distribution's metadata file.
-    """
-
-    candidates = [
-        # This fallback was in place in pre-#5774 times. However, it is insufficient, because dist.egg_name() may be
-        # greenlet-0.4.15-py3.8 (Ubuntu 20.04 package) while the file we are searching for is greenlet-0.4.15.egg-info.
-        f"{dist.egg_name()}.egg-info",
-        # The extra name-version.egg-info path format
-        f"{dist.project_name}-{dist.version}.egg-info",
-        # And the name_with_underscores-version.egg-info.format
-        f"{dist.project_name.replace('-', '_')}-{dist.version}.egg-info",
-    ]
-
-    # As an additional attempt, try to remove the-pyX.Y suffix from egg name.
-    pyxx_suffix = f"-py{sys.version_info[0]}.{sys.version_info[1]}"
-    if dist.egg_name().endswith(pyxx_suffix):
-        candidates.append(dist.egg_name()[:-len(pyxx_suffix)] + ".egg-info")
-
-    for candidate in candidates:
-        candidate_path = os.path.join(dist.location, candidate)
-        if os.path.isfile(candidate_path):
-            return candidate_path
-
-    return None
-
-
-def _copy_metadata_dest(egg_path: str, project_name: str) -> str:
-    """
-    Choose an appropriate destination path for a distribution's metadata.
-
-    Args:
-        egg_path:
-            The output of ``pkg_resources.get_distribution("xyz").egg_info``: a full path to the source
-            ``xyz-version.dist-info`` or ``xyz-version.egg-info`` folder containing package metadata.
-        project_name:
-            The distribution name given.
-    Returns:
-        The *dest* parameter: where in the bundle should this folder go.
-    Raises:
-        RuntimeError:
-            If **egg_path** is None, i.e., no metadata is found.
-    """
-    if egg_path is None:
-        # According to older implementations of this function, packages may have no metadata. I have no idea how this
-        # can happen...
-        raise RuntimeError(f"No metadata path found for distribution '{project_name}'.")
-
-    egg_path = Path(egg_path)
-    _project_name = _normalise_dist(project_name)
-
-    # There has been a fair amount of whack-a-mole fixing to this step. If new cases appear which this function cannot
-    # handle, add them to the corresponding test:
-    #   tests/unit/test_hookutils.py::test_copy_metadata_dest()
-    # See there also for example input/outputs.
-
-    # The most obvious answer is that the metadata folder should have the same name in a PyInstaller build as it does
-    # normally::
-    if _normalise_dist(egg_path.name).startswith(_project_name):
-        # e.g., .../lib/site-packages/xyz-1.2.3.dist-info
-        return egg_path.name
-
-    # Using just the base-name breaks for an egg_path of the form:
-    #   '.../site-packages/xyz-version.win32.egg/EGG-INFO'
-    # because multiple collected metadata folders will be written to the same name 'EGG-INFO' and clobber each other
-    # (see #1888). In this case, the correct behaviour appears to be to use the last two parts of the path:
-    if len(egg_path.parts) >= 2:
-        if _normalise_dist(egg_path.parts[-2]).startswith(_project_name):
-            return os.path.join(*egg_path.parts[-2:])
-
-    # This is something unheard of.
-    raise RuntimeError(
-        f"Unknown metadata type '{egg_path}' from the '{project_name}' distribution. Please report this at "
-        f"https://github/pyinstaller/pyinstaller/issues."
-    )
 
 
 def get_installer(module: str):
@@ -1058,109 +1041,50 @@ def get_installer(module: str):
     :param module: Module to check
     :return: Package manager or None
     """
-    file_name = get_module_file_attribute(module)
-    site_dir = file_name[:file_name.index('site-packages') + len('site-packages')]
-    # This is necessary for situations where the project name and module name do not match, e.g.,
-    # pyenchant (project name) vs. enchant (module name).
-    pkgs = pkg_resources.find_distributions(site_dir)
-    package = None
-    for pkg in pkgs:
-        if module.lower() in pkg.key:
-            package = pkg
-            break
-    metadata_dir, dest_dir = copy_metadata(package)[0]
-    # Check for an INSTALLER file in the metedata_dir and return the first line which should be the program that
-    # installed the module.
-    installer_file = os.path.join(metadata_dir, 'INSTALLER')
-    if os.path.isdir(metadata_dir) and os.path.exists(installer_file):
-        with open(installer_file, 'r') as installer_file_object:
-            lines = installer_file_object.readlines()
-            if lines[0] != '':
-                installer = lines[0].rstrip('\r\n')
-                logger.debug(
-                    "Found installer: '{0}' for module: '{1}' from package: '{2}'".format(installer, module, package)
-                )
-                return installer
+    # Resolve distribution for given module/package name (e.g., enchant -> pyenchant).
+    pkg_to_dist = importlib_metadata.packages_distributions()
+    dist_names = pkg_to_dist.get(module)
+    if dist_names is not None:
+        # A namespace package might result in multiple dists; take the first one...
+        try:
+            dist = importlib_metadata.distribution(dist_names[0])
+            installer_text = dist.read_text('INSTALLER')
+            if installer_text is not None:
+                return installer_text.strip()
+        except importlib_metadata.PackageNotFoundError:
+            # This might happen with eggs if the egg directory name does not match the dist name declared in the
+            # metadata.
+            pass
+
     if compat.is_darwin:
         try:
-            output = compat.exec_command_stdout('port', 'provides', file_name)
+            file_name = get_module_file_attribute(module)
+        except ImportError:
+            return None
+
+        # Attempt to resolve the module file via macports' port command
+        try:
+            output = subprocess.run(['port', 'provides', file_name],
+                                    check=True,
+                                    stdout=subprocess.PIPE,
+                                    encoding='utf-8').stdout
             if 'is provided by' in output:
-                logger.debug(
-                    "Found installer: 'macports' for module: '{0}' from package: '{1}'".format(module, package)
-                )
                 return 'macports'
         except ExecCommandFailed:
             pass
-        real_path = os.path.realpath(file_name)
-        if 'Cellar' in real_path:
-            logger.debug("Found installer: 'homebrew' for module: '{0}' from package: '{1}'".format(module, package))
+
+        # Check if the file is located in homebrew's Cellar directory
+        file_name = os.path.realpath(file_name)
+        if 'Cellar' in file_name:
             return 'homebrew'
+
     return None
-
-
-# ``_map_distribution_to_packages`` is expensive. Compute it when used, then return the memoized value. This is a simple
-# alternative to ``functools.lru_cache``.
-def _memoize(f):
-    memo = []
-
-    def helper():
-        if not memo:
-            memo.append(f())
-        return memo[0]
-
-    return helper
-
-
-# Walk through every package, determining to which distribution it belongs.
-@_memoize
-def _map_distribution_to_packages():
-    logger.info('Determining a mapping of distributions to packages...')
-    dist_to_packages = {}
-    for p in sys.path:
-        # The path entry ``''`` refers to the current directory.
-        if not p:
-            p = '.'
-        # Ignore any entries in ``sys.path`` that do not exist.
-        try:
-            lds = os.listdir(p)
-        except Exception:
-            pass
-        else:
-            for ld in lds:
-                # Not all packages belong to a distribution. Skip these.
-                try:
-                    dist = pkg_resources.get_distribution(ld)
-                except Exception:
-                    pass
-                else:
-                    dist_to_packages.setdefault(dist.key, []).append(ld)
-
-    return dist_to_packages
-
-
-# Given a ``package_name`` as a string, this function returns a list of packages needed to satisfy the requirements.
-# This output can be assigned directly to ``hiddenimports``.
-def requirements_for_package(package_name: str):
-    hiddenimports = []
-
-    dist_to_packages = _map_distribution_to_packages()
-    for requirement in pkg_resources.get_distribution(package_name).requires():
-        if requirement.key in dist_to_packages:
-            required_packages = dist_to_packages[requirement.key]
-            hiddenimports.extend(required_packages)
-        else:
-            logger.warning(
-                'Unable to find package for requirement %s from package %s.', requirement.project_name, package_name
-            )
-
-    logger.info('Packages required by %s:\n%s', package_name, hiddenimports)
-    return hiddenimports
 
 
 def collect_all(
     package_name: str,
     include_py_files: bool = True,
-    filter_submodules: Callable | None = None,
+    filter_submodules: Callable = lambda name: True,
     exclude_datas: list | None = None,
     include_datas: list | None = None,
     on_error: str = "warn once",
@@ -1185,29 +1109,29 @@ def collect_all(
     Returns:
         tuple: A ``(datas, binaries, hiddenimports)`` triplet containing:
 
-        - All data files, raw Python files (if **include_py_files**), and package metadata folders.
+        - All data files, raw Python files (if **include_py_files**), and distribution metadata directories (if
+          applicable).
         - All dynamic libraries as returned by :func:`collect_dynamic_libs`.
-        - All submodules of **packagename** and its dependencies.
+        - All submodules of **package_name**.
 
     Typical use::
 
-        datas, binaries, hiddenimports = collect_all('my_module_name')
+        datas, binaries, hiddenimports = collect_all('my_package_name')
     """
-    datas = []
-    try:
-        datas += copy_metadata(package_name)
-    except Exception as e:
-        logger.warning('Unable to copy metadata for %s: %s', package_name, e)
-    datas += collect_data_files(package_name, include_py_files, excludes=exclude_datas, includes=include_datas)
+    datas = collect_data_files(package_name, include_py_files, excludes=exclude_datas, includes=include_datas)
     binaries = collect_dynamic_libs(package_name)
-    if filter_submodules:
-        hiddenimports = collect_submodules(package_name, on_error=on_error, filter=filter_submodules)
-    else:
-        hiddenimports = collect_submodules(package_name)
-    try:
-        hiddenimports += requirements_for_package(package_name)
-    except Exception as e:
-        logger.warning('Unable to determine requirements for %s: %s', package_name, e)
+    hiddenimports = collect_submodules(package_name, on_error=on_error, filter=filter_submodules)
+
+    # `copy_metadata` requires a dist name instead of importable/package name.
+    # A namespace package might belong to multiple distributions, so process all of them.
+    pkg_to_dist = importlib_metadata.packages_distributions()
+    dist_names = set(pkg_to_dist.get(package_name, []))
+    for dist_name in dist_names:
+        # Copy metadata
+        try:
+            datas += copy_metadata(dist_name)
+        except Exception:
+            pass
 
     return datas, binaries, hiddenimports
 
@@ -1236,13 +1160,11 @@ def collect_entry_point(name: str):
 
     .. versionadded:: 4.3
     """
-    import pkg_resources
     datas = []
     imports = []
-    for dist in pkg_resources.iter_entry_points(name):
-        project_name = '' if dist.dist is None else dist.dist.project_name
-        datas += copy_metadata(project_name)
-        imports.append(dist.module_name)
+    for entry_point in importlib_metadata.entry_points(group=name):
+        datas += copy_metadata(entry_point.dist.name)
+        imports.append(entry_point.module)
     return datas, imports
 
 

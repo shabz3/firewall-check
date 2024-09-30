@@ -105,6 +105,9 @@ def _autodetect_used_backends(hook_api):
             )
             used_backends += co_backends
 
+    # Deduplicate and sort the list of used backends before displaying it.
+    used_backends = sorted(set(used_backends))
+
     if used_backends:
         HOOK_CONFIG_DOCS = 'https://pyinstaller.org/en/stable/hooks-config.html#matplotlib-hooks'
         logger.info(
@@ -132,7 +135,9 @@ def _autodetect_used_backends(hook_api):
         logger.info("Found configured default matplotlib backend: %s", default_backend)
         return [default_backend]
 
-    candidates = ["Qt5Agg", "Gtk3Agg", "TkAgg", "WxAgg"]
+    # `QtAgg` supersedes `Qt5Agg`; however, we keep `Qt5Agg` in the candidate list to support older versions of
+    # matplotlib that do not have `QtAgg`.
+    candidates = ["QtAgg", "Qt5Agg", "Gtk4Agg", "Gtk3Agg", "TkAgg", "WxAgg"]
     if is_darwin:
         candidates = ["MacOSX"] + candidates
     logger.info("Trying determine the default backend as first importable candidate from the list: %r", candidates)
@@ -210,6 +215,9 @@ def hook(hook_api):
         else:
             assert isinstance(backends_method, list), "User-provided backend name(s) must be either a string or a list!"
             backend_names = backends_method
+
+    # Deduplicate and sort the list of selected backends before displaying it.
+    backend_names = sorted(set(backend_names))
 
     logger.info("Selected matplotlib backends: %r", backend_names)
 

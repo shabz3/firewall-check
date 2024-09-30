@@ -19,7 +19,8 @@ from PyInstaller.archive.writers import SplashWriter
 from PyInstaller.building import splash_templates
 from PyInstaller.building.datastruct import Target
 from PyInstaller.building.utils import _check_guts_eq, _check_guts_toc, misc
-from PyInstaller.compat import is_darwin, is_win, is_cygwin
+from PyInstaller.compat import is_darwin
+from PyInstaller.depend import bindepend
 from PyInstaller.utils.hooks import tcl_tk as tcltk_utils
 
 try:
@@ -105,10 +106,6 @@ class Splash(Target):
         :keyword minify_script:
             The splash screen is created by executing an Tcl/Tk script. This option enables minimizing the script,
             meaning removing all non essential parts from the script. Default: ``True``
-        :keyword rundir:
-            The folder name in which tcl/tk will be extracted at runtime. There should be no matching folder in your
-            application to avoid conflicts. Default:  ``'__splash'``
-        :type rundir: str
         :keyword name:
             An optional alternative filename for the .res file. If not specified, a name is generated.
         :type name: str
@@ -148,7 +145,6 @@ class Splash(Target):
         self.name = kwargs.get("name", None)
         self.script_name = kwargs.get("script_name", None)
         self.minify_script = kwargs.get("minify_script", True)
-        self.rundir = kwargs.get("rundir", None)
         self.max_img_size = kwargs.get("max_img_size", (760, 480))
 
         # text options
@@ -168,9 +164,6 @@ class Splash(Target):
         if self.script_name is None:
             self.script_name = root + '_script.tcl'
 
-        if self.rundir is None:
-            self.rundir = self._find_rundir(binaries + datas)
-
         # Internal variables
         try:
             # Do not import _tkinter at the toplevel, because on some systems _tkinter will fail to load, since it is
@@ -182,7 +175,7 @@ class Splash(Target):
             self._tkinter_file = self._tkinter_module.__file__
         except ModuleNotFoundError:
             raise SystemExit(
-                "You platform does not support the splash screen feature, since tkinter is not installed. Please "
+                "Your platform does not support the splash screen feature, since tkinter is not installed. Please "
                 "install tkinter and try again."
             )
 
@@ -209,34 +202,21 @@ class Splash(Target):
             # The user wants a full copy of tk, so make all tk files a requirement.
             self.splash_requirements.update(entry[0] for entry in tcltk_tree)
 
-        self.binaries = []
+        # Scan for binary dependencies of the Tcl/Tk shared libraries, and add them to `binaries` TOC list (which
+        # should really be called `dependencies` as it is not limited to binaries. But it is too late now, and
+        # existing spec files depend on this naming). We specify these binary dependencies (which include the
+        # Tcl and Tk shared libaries themselves) even if the user's program uses tkinter and they would be collected
+        # anyway; let the collection mechanism deal with potential duplicates.
+        tcltk_libs = [(dest_name, src_name, 'BINARY') for dest_name, src_name in (self.tcl_lib, self.tk_lib)]
+        self.binaries = bindepend.binary_dependency_analysis(tcltk_libs)
+
+        # Put all shared library dependencies in `splash_requirements`, so they are made available in onefile mode.
+        self.splash_requirements.update(entry[0] for entry in self.binaries)
+
+        # If the user's program does not use tkinter, add resources from Tcl/Tk tree to the dependencies list.
+        # Do so only for the resources that are part of splash requirements.
         if not self.uses_tkinter:
-            # The user's script does not use tkinter, so we need to provide a TOC of all necessary files add the shared
-            # libraries to the binaries.
-            self.binaries.append((self.tcl_lib[0], self.tcl_lib[1], 'BINARY'))
-            self.binaries.append((self.tk_lib[0], self.tk_lib[1], 'BINARY'))
-
-            # Only add the intersection of the required and the collected resources, or add all entries if full_tk is
-            # true.
             self.binaries.extend(entry for entry in tcltk_tree if entry[0] in self.splash_requirements)
-
-        # Handle extra requirements of Tcl/Tk shared libraries (e.g., vcruntime140.dll on Windows - see issue #6284).
-        # These need to be added to splash requirements, so they are extracted into the initial runtime directory in
-        # order to make onefile builds work.
-        #
-        # The really proper way to implement this would be to perform full dependency analysis on self.tcl_lib[0] and
-        # self.tk_lib[0], and ensure that those dependencies are collected and added to splash requirements. This
-        # would, for example, ensure that on Linux, dependent X libraries are collected, just as if the frozen app
-        # itself was using tkinter. On the other hand, collecting all the extra shared libraries on Linux is currently
-        # futile anyway, because the bootloader's parent process would need to set LD_LIBRARY_PATH to the initial
-        # runtime directory to actually have them loaded (and that requires process to be restarted to take effect).
-        #
-        # So for now, we only deal with this on Windows, in a quick'n'dirty work-around way, by assuming that
-        # vcruntime140.dll is already collected as dependency of some other shared library (e.g., the python shared
-        # library).
-        if is_win or is_cygwin:
-            EXTRA_REQUIREMENTS = {'vcruntime140.dll'}
-            self.splash_requirements.update([name for name, *_ in binaries if name.lower() in EXTRA_REQUIREMENTS])
 
         # Check if all requirements were found.
         collected_files = set(entry[0] for entry in (binaries + datas + self.binaries))
@@ -275,7 +255,6 @@ class Splash(Target):
         ('always_on_top', _check_guts_eq),
         ('full_tk', _check_guts_eq),
         ('minify_script', _check_guts_eq),
-        ('rundir', _check_guts_eq),
         ('max_img_size', _check_guts_eq),
         # calculated/analysed values
         ('uses_tkinter', _check_guts_eq),
@@ -383,7 +362,6 @@ class Splash(Target):
             self.tcl_lib[0],  # tcl86t.dll
             self.tk_lib[0],  # tk86t.dll
             tcltk_utils.TK_ROOTNAME,
-            self.rundir,
             image,
             self.script
         )
@@ -445,7 +423,7 @@ class Splash(Target):
             script = re.sub(' +', ' ', script)
 
         # Write script to disk, so that it is transparent to the user what script is executed.
-        with open(self.script_name, "w") as script_file:
+        with open(self.script_name, "w", encoding="utf-8") as script_file:
             script_file.write(script)
         return script
 
@@ -458,23 +436,3 @@ class Splash(Target):
             if pathlib.PurePath(src_name) == tkinter_file:
                 return True
         return False
-
-    @staticmethod
-    def _find_rundir(structure):
-        # First try a name the user could understand, if one would find the directory.
-        rundir = '__splash%s'
-        candidate = rundir % ""
-        counter = 0
-
-        # Run this loop as long as a folder exist named like rundir. In most cases __splash will be sufficient and this
-        # loop won't enter.
-        while any(e[0].startswith(candidate + os.sep) for e in structure):
-            # just append to rundir a counter
-            candidate = rundir % str(counter)
-            counter += 1
-
-            # The SPLASH_DATA_HEADER structure limits the name to be 16 bytes at maximum. So if we exceed the limit
-            # raise an error. This will never happen, since there are 10^8 different possibilities, but just in case.
-            assert len(candidate) <= 16
-
-        return candidate

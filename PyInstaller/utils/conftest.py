@@ -13,6 +13,7 @@ import copy
 import glob
 import logging
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -334,6 +335,12 @@ class AppBuilder:
         if is_win:
             # Minimum Windows PATH is in most cases:   C:\Windows\system32;C:\Windows
             prog_env['PATH'] = os.pathsep.join(winutils.get_system_path())
+        # On macOS, we similarly set up minimal PATH with system directories, in case utilities from there are used by
+        # tested python code (for example, matplotlib >= 3.9.0 uses `system_profiler` that is found in /usr/sbin).
+        if is_darwin:
+            # The following paths are registered when application is launched via Finder, and are a subset of what is
+            # typically available in the shell.
+            prog_env['PATH'] = os.pathsep.join(['/usr/bin', '/bin', '/usr/sbin', '/sbin'])
 
         exe_path = prog
         if run_from_path:
@@ -425,7 +432,7 @@ class AppBuilder:
 
         pyi_args = [self.script] + default_args + args
         # TODO: fix return code in running PyInstaller programmatically.
-        PYI_CONFIG = configure.get_config(upx_dir=None)
+        PYI_CONFIG = configure.get_config()
         # Override CACHEDIR for PyInstaller and put it into self.tmpdir
         PYI_CONFIG['cachedir'] = str(self._tmpdir)
 
@@ -442,7 +449,7 @@ class AppBuilder:
         """
         print('EXECUTING MATCHING:', toc_log)
         fname_list = pkg_archive_contents(exe)
-        with open(toc_log, 'r') as f:
+        with open(toc_log, 'r', encoding='utf-8') as f:
             pattern_list = eval(f.read())
         # Alphabetical order of patterns.
         pattern_list.sort()
@@ -541,7 +548,7 @@ def compiled_dylib(tmpdir, request):
         elif is_darwin:
             tmp_data_dir = tmp_data_dir.join('ctypes_dylib.dylib')
             # On Mac OS X we need to detect architecture - 32 bit or 64 bit.
-            arch = 'i386' if architecture == '32bit' else 'x86_64'
+            arch = 'arm64' if platform.machine() == 'arm64' else 'i386' if architecture == '32bit' else 'x86_64'
             cmd = (
                 'gcc -arch ' + arch + ' -Wall -dynamiclib '
                 'ctypes_dylib.c -o ctypes_dylib.dylib -headerpad_max_install_names'

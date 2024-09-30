@@ -82,11 +82,14 @@ if sys.platform.startswith('win'):
     import pyimod04_pywin32
     pyimod04_pywin32.install()
 
-# Make .eggs and zipfiles available at runtime
-d = "eggs"
-d = os.path.join(sys._MEIPASS, d)
-# Test if the 'eggs' directory exists. This allows us to opportunistically include this script into the packaged exe,
-# even if no eggs were found when packaging the program. (Which may be a use-case, see issue #653).
-if os.path.isdir(d):
-    for fn in os.listdir(d):
-        sys.path.append(os.path.join(d, fn))
+# Apply a hack for metadata that was collected from (unzipped) python eggs; the EGG-INFO directories are collected into
+# their parent directories (my_package-version.egg/EGG-INFO), and for metadata to be discoverable by
+# `importlib.metadata`, the .egg directory needs to be in `sys.path`. The deprecated `pkg_resources` does not have this
+# limitation, and seems to work as long as the .egg directory's parent directory (in our case `sys._MEIPASS` is in
+# `sys.path`.
+for entry in os.listdir(sys._MEIPASS):
+    entry = os.path.join(sys._MEIPASS, entry)
+    if not os.path.isdir(entry):
+        continue
+    if entry.endswith('.egg'):
+        sys.path.append(entry)

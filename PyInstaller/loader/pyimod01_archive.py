@@ -14,7 +14,6 @@
 # List of built-in modules: sys.builtin_module_names
 # List of modules collected into base_library.zip: PyInstaller.compat.PY3_BASE_MODULES
 
-import sys
 import os
 import struct
 import marshal
@@ -26,51 +25,15 @@ import _frozen_importlib
 
 PYTHON_MAGIC_NUMBER = _frozen_importlib._bootstrap_external.MAGIC_NUMBER
 
-# For decrypting Python modules.
-CRYPT_BLOCK_SIZE = 16
-
 # Type codes for PYZ PYZ entries
 PYZ_ITEM_MODULE = 0
 PYZ_ITEM_PKG = 1
-PYZ_ITEM_DATA = 2
+PYZ_ITEM_DATA = 2  # deprecated; PYZ does not contain any data entries anymore
 PYZ_ITEM_NSPKG = 3  # PEP-420 namespace package
 
 
 class ArchiveReadError(RuntimeError):
     pass
-
-
-class Cipher:
-    """
-    This class is used only to decrypt Python modules.
-    """
-    def __init__(self):
-        # At build-time the key is given to us from inside the spec file. At bootstrap-time, we must look for it
-        # ourselves, by trying to import the generated 'pyi_crypto_key' module.
-        import pyimod00_crypto_key
-        key = pyimod00_crypto_key.key
-
-        assert type(key) is str
-        if len(key) > CRYPT_BLOCK_SIZE:
-            self.key = key[0:CRYPT_BLOCK_SIZE]
-        else:
-            self.key = key.zfill(CRYPT_BLOCK_SIZE)
-        assert len(self.key) == CRYPT_BLOCK_SIZE
-
-        import tinyaes
-        self._aesmod = tinyaes
-        # Issue #1663: Remove the AES module from sys.modules list. Otherwise it interferes with using 'tinyaes' module
-        # in users' code.
-        del sys.modules['tinyaes']
-
-    def __create_cipher(self, iv):
-        # The 'AES' class is stateful, and this factory method is used to re-initialize the block cipher class with
-        # each call to xcrypt().
-        return self._aesmod.AES(self.key.encode(), iv)
-
-    def decrypt(self, data):
-        cipher = self.__create_cipher(data[:CRYPT_BLOCK_SIZE])
-        return cipher.CTR_xcrypt_buffer(data[CRYPT_BLOCK_SIZE:])
 
 
 class ZlibArchiveReader:
@@ -85,15 +48,6 @@ class ZlibArchiveReader:
         self._start_offset = start_offset
 
         self.toc = {}
-
-        self.cipher = None
-
-        # Try to create Cipher() instance; if encryption is not enabled, pyimod00_crypto_key is not available, and
-        # instantiation fails with ImportError.
-        try:
-            self.cipher = Cipher()
-        except ImportError:
-            pass
 
         # If no offset is given, try inferring it from filename
         if start_offset is None:
@@ -144,7 +98,7 @@ class ZlibArchiveReader:
 
     def is_package(self, name):
         """
-        Check if the given name refers to a package entry. Used by FrozenImporter at runtime.
+        Check if the given name refers to a package entry. Used by PyiFrozenImporter at runtime.
         """
         entry = self.toc.get(name)
         if entry is None:
@@ -154,7 +108,7 @@ class ZlibArchiveReader:
 
     def is_pep420_namespace_package(self, name):
         """
-        Check if the given name refers to a namespace package entry. Used by FrozenImporter at runtime.
+        Check if the given name refers to a namespace package entry. Used by PyiFrozenImporter at runtime.
         """
         entry = self.toc.get(name)
         if entry is None:
@@ -192,8 +146,6 @@ class ZlibArchiveReader:
             )
 
         try:
-            if self.cipher:
-                obj = self.cipher.decrypt(obj)
             obj = zlib.decompress(obj)
             if typecode in (PYZ_ITEM_MODULE, PYZ_ITEM_PKG, PYZ_ITEM_NSPKG) and not raw:
                 obj = marshal.loads(obj)

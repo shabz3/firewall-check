@@ -9,7 +9,6 @@
 # SPDX-License-Identifier: (GPL-2.0-or-later WITH Bootloader-exception)
 #-----------------------------------------------------------------------------
 
-import locale
 import os
 
 from PyInstaller import compat
@@ -39,8 +38,10 @@ def _get_tcl_tk_info():
     except ImportError:
         # tkinter unavailable
         return None, None, None, False
-
-    tcl = tkinter.Tcl()
+    try:
+        tcl = tkinter.Tcl()
+    except tkinter.TclError:  # e.g. "Can't find a usable init.tcl in the following directories: ..."
+        return None, None, None, False
 
     # Query the location of Tcl library/data directory.
     tcl_dir = tcl.eval("info library")
@@ -94,7 +95,8 @@ def _warn_if_activetcl_or_teapot_installed(tcl_root, tcltree):
     mentions_teapot = False
     # TCL/TK reads files using the system encoding:
     # https://www.tcl.tk/doc/howto/i18n.html#system_encoding
-    with open(init_resource, 'r', encoding=locale.getpreferredencoding()) as init_file:
+    # On macOS, system encoding is UTF-8
+    with open(init_resource, 'r', encoding='utf8') as init_file:
         for line in init_file.readlines():
             line = line.strip().lower()
             if line.startswith('#'):
@@ -135,30 +137,21 @@ def find_tcl_tk_shared_libs(tkinter_ext_file):
     tk_lib = None
     tk_libpath = None
 
-    # Do not use bindepend.selectImports, as it ignores libraries seen during previous invocations.
-    _tkinter_imports = bindepend.getImports(tkinter_ext_file)
+    for _, lib_path in bindepend.get_imports(tkinter_ext_file):  # (name, fullpath) tuple
+        if lib_path is None:
+            continue  # Skip unresolved entries
 
-    def _get_library_path(lib):
-        if compat.is_win:
-            # On Windows, we need to resolve full path to the library.
-            path = bindepend.getfullnameof(lib)
-        else:
-            # Non-Windows systems (including Cygwin) already return full path to the library.
-            path = lib
-        return path
-
-    for lib in _tkinter_imports:
-        # On some platforms, full path to the shared library is returned. So check only basename to prevent false
-        # positive matches due to words tcl or tk being contained in the path.
-        lib_name = os.path.basename(lib)
+        # For comparison, take basename of lib_path. On macOS, lib_name returned by get_imports is in fact referenced
+        # name, which is not necessarily just a basename.
+        lib_name = os.path.basename(lib_path)
         lib_name_lower = lib_name.lower()  # lower-case for comparisons
 
         if 'tcl' in lib_name_lower:
             tcl_lib = lib_name
-            tcl_libpath = _get_library_path(lib)
+            tcl_libpath = lib_path
         elif 'tk' in lib_name_lower:
             tk_lib = lib_name
-            tk_libpath = _get_library_path(lib)
+            tk_libpath = lib_path
 
     return [(tcl_lib, tcl_libpath), (tk_lib, tk_libpath)]
 

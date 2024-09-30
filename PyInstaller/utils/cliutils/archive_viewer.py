@@ -19,6 +19,13 @@ import sys
 import PyInstaller.log
 from PyInstaller.archive.readers import CArchiveReader, ZlibArchiveReader
 
+try:
+    from argcomplete import autocomplete
+except ImportError:
+
+    def autocomplete(parser):
+        return None
+
 
 class ArchiveViewer:
     def __init__(self, filename, interactive_mode, recursive_mode, brief_mode):
@@ -182,6 +189,10 @@ class ArchiveViewer:
 
     def _show_archive_contents(self, archive_name, archive):
         if isinstance(archive, CArchiveReader):
+            if archive.options:
+                print(f"Options in {archive_name!r} (PKG/CArchive):")
+                for option in archive.options:
+                    print(f" {option}")
             print(f"Contents of {archive_name!r} (PKG/CArchive):")
             if self.brief_mode:
                 for name in archive.toc.keys():
@@ -237,6 +248,7 @@ def run():
         help="PyInstaller archive to process.",
     )
 
+    autocomplete(parser)
     args = parser.parse_args()
     PyInstaller.log.__process_options(parser, args)
 

@@ -12,6 +12,7 @@
 import glob
 import os
 import shutil
+import subprocess
 
 from PyInstaller import compat
 from PyInstaller.config import CONF  # workpath
@@ -52,7 +53,7 @@ def _collect_loaders(libdir):
 
     # Sometimes the loaders are stored in a different directory from the library (msys2)
     if not loader_libs:
-        pattern = os.path.join(libdir, '..', 'lib', LOADERS_PATH, lib_ext)
+        pattern = os.path.abspath(os.path.join(libdir, '..', 'lib', LOADERS_PATH, lib_ext))
         for f in glob.glob(pattern):
             loader_libs.append(f)
 
@@ -80,7 +81,10 @@ def _generate_loader_cache(gdk_pixbuf_query_loaders, libdir, loader_libs):
     #
     # On Windows, the loaders lib directory is relative, starts with 'lib', and uses \\ as path separators
     # (escaped \).
-    cachedata = compat.exec_command_stdout(gdk_pixbuf_query_loaders, *loader_libs)
+    cachedata = subprocess.run([gdk_pixbuf_query_loaders, *loader_libs],
+                               check=True,
+                               stdout=subprocess.PIPE,
+                               encoding='utf-8').stdout
 
     output_lines = []
     prefix = '"' + os.path.join(libdir, 'gdk-pixbuf-2.0', '2.10.0')
@@ -88,6 +92,9 @@ def _generate_loader_cache(gdk_pixbuf_query_loaders, libdir, loader_libs):
 
     win_prefix = '"' + '\\\\'.join(['lib', 'gdk-pixbuf-2.0', '2.10.0'])
     win_plen = len(win_prefix)
+
+    msys2_prefix = '"' + os.path.abspath(os.path.join(libdir, '..', 'lib', 'gdk-pixbuf-2.0', '2.10.0'))
+    msys2_plen = len(msys2_prefix)
 
     # For each line in the updated loader cache...
     for line in cachedata.splitlines():
@@ -97,6 +104,8 @@ def _generate_loader_cache(gdk_pixbuf_query_loaders, libdir, loader_libs):
             line = '"@executable_path/' + LOADER_CACHE_DEST_PATH + line[plen:]
         elif line.startswith(win_prefix):
             line = '"' + LOADER_CACHE_DEST_PATH.replace('/', '\\\\') + line[win_plen:]
+        elif line.startswith(msys2_prefix):
+            line = ('"' + LOADER_CACHE_DEST_PATH + line[msys2_plen:]).replace('/', '\\\\')
         output_lines.append(line)
 
     return '\n'.join(output_lines)
@@ -127,7 +136,7 @@ def hook(hook_api):
         # Generate loader cache; we need to store it to CONF['workpath'] so we can collect it as a data file.
         cachedata = _generate_loader_cache(gdk_pixbuf_query_loaders, libdir, loader_libs)
         cachefile = os.path.join(CONF['workpath'], 'loaders.cache')
-        with open(cachefile, 'w') as fp:
+        with open(cachefile, 'w', encoding='utf-8') as fp:
             fp.write(cachedata)
         datas.append((cachefile, LOADER_CACHE_DEST_PATH))
 

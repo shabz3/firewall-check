@@ -52,7 +52,7 @@ from PyInstaller.depend import bytecode
 from PyInstaller.depend.imphook import AdditionalFilesCache, ModuleHookCache
 from PyInstaller.depend.imphookapi import (PreFindModulePathAPI, PreSafeImportModuleAPI)
 from PyInstaller.lib.modulegraph.find_modules import get_implies
-from PyInstaller.lib.modulegraph.modulegraph import ModuleGraph, DEFAULT_IMPORT_LEVEL, ABSOLUTE_IMPORT_LEVEL
+from PyInstaller.lib.modulegraph.modulegraph import ModuleGraph, DEFAULT_IMPORT_LEVEL, ABSOLUTE_IMPORT_LEVEL, Package
 from PyInstaller.log import DEBUG, INFO, TRACE
 from PyInstaller.utils.hooks import collect_submodules, is_package
 
@@ -373,10 +373,15 @@ class PyiModuleGraph(ModuleGraph):
                 # integer indicating the relative level. We do not use equality comparison just in case we ever happen
                 # to get ABSOLUTE_OR_RELATIVE_IMPORT_LEVEL (-1), which is a remnant of python2 days.
                 if level > ABSOLUTE_IMPORT_LEVEL:
-                    if target_module_partname:
-                        base_module_name = source_module.identifier + '.' + target_module_partname
-                    else:
+                    if isinstance(source_module, Package):
+                        # Package
                         base_module_name = source_module.identifier
+                    else:
+                        # Module in a package; base name must be the parent package name!
+                        base_module_name = '.'.join(source_module.identifier.split('.')[:-1])
+
+                    if target_module_partname:
+                        base_module_name += '.' + target_module_partname
 
                     # Adjust the base module name based on level
                     if level > 1:
@@ -429,7 +434,24 @@ class PyiModuleGraph(ModuleGraph):
                     # None...
                     target_attr_names = filtered_target_attr_names or None
 
-        return super()._safe_import_hook(target_module_partname, source_module, target_attr_names, level, edge_attr)
+        ret_modules = super()._safe_import_hook(
+            target_module_partname, source_module, target_attr_names, level, edge_attr
+        )
+
+        # Ensure that hooks are pre-loaded for returned module(s), in an attempt to ensure that hooks are called in the
+        # order of imports. The hooks are cached, so there should be no downsides to pre-loading hooks early (as opposed
+        # to loading them in post-graph analysis). When modules are imported from other modules, the hooks for those
+        # referring (source) modules and their parent package(s) are loaded by the exclusion mechanism that takes place
+        # before the above `super()._safe_import_hook` call. The code below attempts to complement that, but for the
+        # referred (target) modules and their parent package(s).
+        for ret_module in ret_modules:
+            if type(ret_module).__name__ not in VALID_MODULE_TYPES:
+                continue
+            # (Ab)use the `_find_all_excluded_imports` helper to load all hooks for the given module and its parent
+            # package(s).
+            self._find_all_excluded_imports(ret_module.identifier)
+
+        return ret_modules
 
     def _safe_import_module(self, module_basename, module_name, parent_package):
         """
@@ -804,9 +826,8 @@ class PyiModuleGraph(ModuleGraph):
         require metadata for some distribution (which may not be its own) at runtime. In the case of a match,
         collect the required metadata.
         """
-        from pkg_resources import DistributionNotFound
-
         from PyInstaller.utils.hooks import copy_metadata
+        from PyInstaller.compat import importlib_metadata
 
         # Generate sets of possible function names to search for.
         need_metadata = set()
@@ -831,7 +852,7 @@ class PyiModuleGraph(ModuleGraph):
                         elif function_name in need_recursive_metadata:
                             out.update(copy_metadata(package, recursive=True))
 
-                    except DistributionNotFound:
+                    except importlib_metadata.PackageNotFoundError:
                         # Currently, we opt to silently skip over missing metadata.
                         continue
 
@@ -846,6 +867,30 @@ class PyiModuleGraph(ModuleGraph):
             str(node.identifier) for node in self.iter_graph(start=self._top_script_node)
             if type(node).__name__ == 'Package'
         ]
+
+    def make_hook_binaries_toc(self) -> list:
+        """
+        Return the TOC list of binaries collected by hooks."
+        """
+        toc = []
+        for node in self.iter_graph(start=self._top_script_node):
+            module_name = str(node.identifier)
+            for dest_name, src_name in self._additional_files_cache.binaries(module_name):
+                toc.append((dest_name, src_name, 'BINARY'))
+
+        return toc
+
+    def make_hook_datas_toc(self) -> list:
+        """
+        Return the TOC list of data files collected by hooks."
+        """
+        toc = []
+        for node in self.iter_graph(start=self._top_script_node):
+            module_name = str(node.identifier)
+            for dest_name, src_name in self._additional_files_cache.datas(module_name):
+                toc.append((dest_name, src_name, 'DATA'))
+
+        return toc
 
 
 _cached_module_graph_ = None
@@ -874,6 +919,14 @@ def initialize_modgraph(excludes=(), user_hook_dirs=()):
     # Normalize parameters to ensure tuples and make comparison work.
     user_hook_dirs = user_hook_dirs or ()
     excludes = excludes or ()
+
+    # Ensure that __main__ is always excluded from the modulegraph, to prevent accidentally pulling PyInstaller itself
+    # into the modulegraph. This seems to happen on Windows, because modulegraph is able to resolve `__main__` as
+    # `.../PyInstaller.exe/__main__.py` and analyze it. The `__main__` has a different meaning during analysis compared
+    # to the program run-time, when it refers to the program's entry-point (which would always be part of the
+    # modulegraph anyway, by virtue of being the starting point of the analysis).
+    if "__main__" not in excludes:
+        excludes += ("__main__",)
 
     # If there is a graph cached with the same excludes, reuse it. See ``PyiModulegraph._reset()`` for what is
     # reset. This cache is used primarily to speed up the test-suite. Fixture `pyi_modgraph` calls this function with

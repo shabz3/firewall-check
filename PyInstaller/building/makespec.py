@@ -14,17 +14,15 @@ Automatically build spec files containing a description of the project.
 
 import argparse
 import os
+import re
 import sys
 
 from PyInstaller import DEFAULT_SPECPATH, HOMEPATH
 from PyInstaller import log as logging
-from PyInstaller.building.templates import (
-    bundleexetmplt, bundletmplt, cipher_absent_template, cipher_init_template, onedirtmplt, onefiletmplt, splashtmpl
-)
-from PyInstaller.compat import expand_path, is_darwin, is_win
+from PyInstaller.building.templates import bundleexetmplt, bundletmplt, onedirtmplt, onefiletmplt, splashtmpl
+from PyInstaller.compat import is_darwin, is_win
 
 logger = logging.getLogger(__name__)
-add_command_sep = os.pathsep
 
 # This list gives valid choices for the ``--debug`` command-line option, except for the ``all`` choice.
 DEBUG_ARGUMENT_CHOICES = ['imports', 'bootloader', 'noarchive']
@@ -57,17 +55,31 @@ def make_path_spec_relative(filename, spec_dir):
 path_conversions = ((HOMEPATH, "HOMEPATH"),)
 
 
-def add_data_or_binary(string):
-    try:
-        src, dest = string.split(add_command_sep)
-    except ValueError as e:
-        # Split into SRC and DEST failed, wrong syntax
-        raise argparse.ArgumentError("Wrong syntax, should be SRC{}DEST".format(add_command_sep)) from e
-    if not src or not dest:
-        # Syntax was correct, but one or both of SRC and DEST was not given
-        raise argparse.ArgumentError("You have to specify both SRC and DEST")
-    # Return tuple containing SRC and SRC
-    return src, dest
+class SourceDestAction(argparse.Action):
+    """
+    A command line option which takes multiple source:dest pairs.
+    """
+    def __init__(self, *args, default=None, metavar=None, **kwargs):
+        super().__init__(*args, default=[], metavar='SOURCE:DEST', **kwargs)
+
+    def __call__(self, parser, namespace, value, option_string=None):
+        try:
+            # Find the only separator that isn't a Windows drive.
+            separator, = (m for m in re.finditer(rf"(^\w:[/\\])|[:{os.pathsep}]", value) if not m[1])
+        except ValueError:
+            # Split into SRC and DEST failed, wrong syntax
+            raise argparse.ArgumentError(self, f'Wrong syntax, should be {self.option_strings[0]}=SOURCE:DEST')
+        src = value[:separator.start()]
+        dest = value[separator.end():]
+        if not src or not dest:
+            # Syntax was correct, but one or both of SRC and DEST was not given
+            raise argparse.ArgumentError(self, "You have to specify both SOURCE and DEST")
+
+        # argparse is not particularly smart with copy by reference typed defaults. If the current list is the default,
+        # replace it before modifying it to avoid changing the default.
+        if getattr(namespace, self.dest) is self.default:
+            setattr(namespace, self.dest, [])
+        getattr(namespace, self.dest).append((src, dest))
 
 
 def make_variable_path(filename, conversions=path_conversions):
@@ -91,13 +103,34 @@ def make_variable_path(filename, conversions=path_conversions):
     return None, filename
 
 
-def deprecated_key_option(x):
-    logger.log(
-        logging.DEPRECATION,
-        "Bytecode encryption will be removed in PyInstaller v6. Please remove your --key=xxx argument to avoid "
-        "breakages on upgrade. For the rationale/alternatives see https://github.com/pyinstaller/pyinstaller/pull/6999"
-    )
-    return x
+def removed_key_option(x):
+    from PyInstaller.exceptions import RemovedCipherFeatureError
+    raise RemovedCipherFeatureError("Please remove your --key=xxx argument.")
+
+
+class _RemovedFlagAction(argparse.Action):
+    def __init__(self, *args, **kwargs):
+        kwargs["help"] = argparse.SUPPRESS
+        kwargs["nargs"] = 0
+        super().__init__(*args, **kwargs)
+
+
+class _RemovedNoEmbedManifestAction(_RemovedFlagAction):
+    def __call__(self, *args, **kwargs):
+        from PyInstaller.exceptions import RemovedExternalManifestError
+        raise RemovedExternalManifestError("Please remove your --no-embed-manifest argument.")
+
+
+class _RemovedWinPrivateAssembliesAction(_RemovedFlagAction):
+    def __call__(self, *args, **kwargs):
+        from PyInstaller.exceptions import RemovedWinSideBySideSupportError
+        raise RemovedWinSideBySideSupportError("Please remove your --win-private-assemblies argument.")
+
+
+class _RemovedWinNoPreferRedirectsAction(_RemovedFlagAction):
+    def __call__(self, *args, **kwargs):
+        from PyInstaller.exceptions import RemovedWinSideBySideSupportError
+        raise RemovedWinSideBySideSupportError("Please remove your --win-no-prefer-redirects argument.")
 
 
 # An object used in place of a "path string", which knows how to repr() itself using variable names instead of
@@ -234,27 +267,29 @@ def __add_options(parser):
         "--name",
         help="Name to assign to the bundled app and spec file (default: first script's basename)",
     )
+    g.add_argument(
+        "--contents-directory",
+        help="For onedir builds only, specify the name of the directory in which all supporting files (i.e. everything "
+        "except the executable itself) will be placed in. Use \".\" to re-enable old onedir layout without contents "
+        "directory.",
+    )
 
     g = parser.add_argument_group('What to bundle, where to search')
     g.add_argument(
         '--add-data',
-        action='append',
-        default=[],
-        type=add_data_or_binary,
-        metavar='<SRC;DEST or SRC:DEST>',
+        action=SourceDestAction,
         dest='datas',
-        help='Additional non-binary files or folders to be added to the executable. The path separator  is platform '
-        'specific, ``os.pathsep`` (which is ``;`` on Windows and ``:`` on most unix systems) is used. This option '
-        'can be used multiple times.',
+        help="Additional data files or directories containing data files to be added to the application. The argument "
+        'value should be in form of "source:dest_dir", where source is the path to file (or directory) to be '
+        "collected, dest_dir is the destination directory relative to the top-level application directory, and both "
+        "paths are separated by a colon (:). To put a file in the top-level application directory, use . as a "
+        "dest_dir. This option can be used multiple times."
     )
     g.add_argument(
         '--add-binary',
-        action='append',
-        default=[],
-        type=add_data_or_binary,
-        metavar='<SRC;DEST or SRC:DEST>',
+        action=SourceDestAction,
         dest="binaries",
-        help='Additional binary files to be added to the executable. See the ``--add-data`` option for more details. '
+        help='Additional binary files to be added to the executable. See the ``--add-data`` option for the format. '
         'This option can be used multiple times.',
     )
     g.add_argument(
@@ -356,7 +391,7 @@ def __add_options(parser):
         '--key',
         dest='key',
         help=argparse.SUPPRESS,
-        type=deprecated_key_option,
+        type=removed_key_option,
     )
     g.add_argument(
         '--splash',
@@ -407,13 +442,24 @@ def __add_options(parser):
         ),
     )
     g.add_argument(
+        '--optimize',
+        dest='optimize',
+        metavar='LEVEL',
+        type=int,
+        choices={-1, 0, 1, 2},
+        default=None,
+        help='Bytecode optimization level used for collected python modules and scripts. For details, see the section '
+        '“Bytecode Optimization Level” in PyInstaller manual.',
+    )
+    g.add_argument(
         '--python-option',
         dest='python_options',
         metavar='PYTHON_OPTION',
         action='append',
         default=[],
         help='Specify a command-line option to pass to the Python interpreter at runtime. Currently supports '
-        '"v" (equivalent to "--debug imports"), "u", and "W <warning control>".',
+        '"v" (equivalent to "--debug imports"), "u", "W <warning control>", "X <xoption>", and "hash_seed=<value>". '
+        'For details, see the section "Specifying Python Interpreter Options" in PyInstaller manual.',
     )
     g.add_argument(
         "-s",
@@ -460,6 +506,14 @@ def __add_options(parser):
         "file. This option is ignored on *NIX systems.",
     )
     g.add_argument(
+        "--hide-console",
+        type=str,
+        choices={'hide-early', 'hide-late', 'minimize-early', 'minimize-late'},
+        default=None,
+        help="Windows only: in console-enabled executable, have bootloader automatically hide or minimize the console "
+        "window if the program owns the console window (i.e., was not launched from an existing console window).",
+    )
+    g.add_argument(
         "-i",
         "--icon",
         action='append',
@@ -495,10 +549,7 @@ def __add_options(parser):
     )
     g.add_argument(
         "--no-embed-manifest",
-        dest="embed_manifest",
-        action="store_false",
-        help="Generate an external .exe.manifest file instead of embedding the manifest into the exe. Applicable only "
-        "to onedir mode; in onefile mode, the manifest is always embedded, regardless of this option.",
+        action=_RemovedNoEmbedManifestAction,
     )
     g.add_argument(
         "-r",
@@ -531,19 +582,11 @@ def __add_options(parser):
     g = parser.add_argument_group('Windows Side-by-side Assembly searching options (advanced)')
     g.add_argument(
         "--win-private-assemblies",
-        dest="win_private_assemblies",
-        action="store_true",
-        help="Any Shared Assemblies bundled into the application will be changed into Private Assemblies. This means "
-        "the exact versions of these assemblies will always be used, and any newer versions installed on user machines "
-        "at the system level will be ignored.",
+        action=_RemovedWinPrivateAssembliesAction,
     )
     g.add_argument(
         "--win-no-prefer-redirects",
-        dest="win_no_prefer_redirects",
-        action="store_true",
-        help="While searching for Shared or Private Assemblies to bundle into the application, PyInstaller will "
-        "prefer not to follow policies that redirect to newer versions, and will try to bundle the exact versions of "
-        "the assembly.",
+        action=_RemovedWinNoPreferRedirectsAction,
     )
 
     g = parser.add_argument_group('Mac OS specific options')
@@ -597,9 +640,11 @@ def __add_options(parser):
         "--runtime-tmpdir",
         dest="runtime_tmpdir",
         metavar="PATH",
-        help="Where to extract libraries and support files in `onefile`-mode. If this option is given, the bootloader "
+        help="Where to extract libraries and support files in `onefile` mode. If this option is given, the bootloader "
         "will ignore any temp-folder location defined by the run-time OS. The ``_MEIxxxxxx``-folder will be created "
-        "here. Please use this option only if you know what you are doing.",
+        "here. Please use this option only if you know what you are doing. Note that on POSIX systems, PyInstaller's "
+        "bootloader does NOT perform shell-style environment variable expansion on the given path string. Therefore, "
+        "using environment variables (e.g., ``~`` or ``$HOME``) in path will NOT work.",
     )
     g.add_argument(
         "--bootloader-ignore-signals",
@@ -622,6 +667,7 @@ def main(
     noupx=False,
     upx_exclude=None,
     runtime_tmpdir=None,
+    contents_directory=None,
     pathex=[],
     version_file=None,
     specpath=None,
@@ -631,18 +677,14 @@ def main(
     binaries=[],
     icon_file=None,
     manifest=None,
-    embed_manifest=True,
     resources=[],
     bundle_identifier=None,
     hiddenimports=[],
     hookspath=[],
-    key=None,
     runtime_hooks=[],
     excludes=[],
     uac_admin=False,
     uac_uiaccess=False,
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
     collect_submodules=[],
     collect_binaries=[],
     collect_data=[],
@@ -654,6 +696,8 @@ def main(
     codesign_identity=None,
     entitlements_file=None,
     argv_emulation=False,
+    hide_console=None,
+    optimize=None,
     **_kwargs
 ):
     # Default values for onefile and console when not explicitly specified on command-line (indicated by None)
@@ -671,8 +715,9 @@ def main(
     if specpath is None:
         specpath = DEFAULT_SPECPATH
     else:
-        # Expand tilde to user's home directory.
-        specpath = expand_path(specpath)
+        # Expand starting tilde into user's home directory, as a work-around for tilde not being expanded by shell when
+        # using ˙--specpath=~/path/abc` instead of ˙--specpath ~/path/abc` (or when the path argument is quoted).
+        specpath = os.path.expanduser(specpath)
     # If cwd is the root directory of PyInstaller, generate the .spec file in ./appname/ subdirectory.
     if specpath == HOMEPATH:
         specpath = os.path.join(HOMEPATH, name)
@@ -702,6 +747,10 @@ def main(
         # On Mac OS, the default icon has to be copied into the .app bundle.
         # The the text value 'None' means - use default icon.
         icon_file = 'None'
+    if contents_directory:
+        exe_options += "\n    contents_directory='%s'," % (contents_directory or "_internal")
+    if hide_console:
+        exe_options += "\n    hide_console='%s'," % hide_console
 
     if bundle_identifier:
         # We need to encapsulate it into apostrofes.
@@ -714,8 +763,6 @@ def main(
         else:
             # Assume filename
             exe_options += "\n    manifest='%s'," % escape_win_filepath(manifest)
-    if not embed_manifest:
-        exe_options += "\n    embed_manifest=False,"
     if resources:
         resources = list(map(escape_win_filepath, resources))
         exe_options += "\n    resources=%s," % repr(resources)
@@ -731,20 +778,6 @@ def main(
     scripts = [make_path_spec_relative(x, specpath) for x in scripts]
     # With absolute paths replace prefix with variable HOMEPATH.
     scripts = list(map(Path, scripts))
-
-    if key:
-        # Try to import tinyaes as we need it for bytecode obfuscation.
-        try:
-            import tinyaes  # noqa: F401 (test import)
-        except ImportError:
-            logger.error(
-                'We need tinyaes to use byte-code obfuscation but we could not find it. You can install it '
-                'with pip by running:\n  pip install tinyaes'
-            )
-            sys.exit(1)
-        cipher_init = cipher_init_template % {'key': key}
-    else:
-        cipher_init = cipher_absent_template
 
     # Translate the default of ``debug=None`` to an empty list.
     if debug is None:
@@ -766,6 +799,34 @@ def main(
     else:
         splash_init = splash_binaries = splash_target = ""
 
+    # Infer byte-code optimization level.
+    opt_level = sum([opt == 'O' for opt in python_options])
+    if opt_level > 2:
+        logger.warning(
+            "The switch '--python-option O' has been specified %d times - it should be specified at most twice!",
+            opt_level,
+        )
+        opt_level = 2
+
+    if optimize is None:
+        if opt_level == 0:
+            # Infer from running python process
+            optimize = sys.flags.optimize
+        else:
+            # Infer from `--python-option O` switch(es).
+            optimize = opt_level
+    elif optimize != opt_level and opt_level != 0:
+        logger.warning(
+            "Mismatch between optimization level passed via --optimize switch (%d) and number of '--python-option O' "
+            "switches (%d)!",
+            optimize,
+            opt_level,
+        )
+
+    if optimize >= 0:
+        # Ensure OPTIONs passed to bootloader match the optimization settings.
+        python_options += max(0, optimize - opt_level) * ['O']
+
     # Create OPTIONs array
     if 'imports' in debug and 'v' not in python_options:
         python_options.append('v')
@@ -780,6 +841,7 @@ def main(
         'preamble': preamble.content,
         'name': name,
         'noarchive': 'noarchive' in debug,
+        'optimize': optimize,
         'options': python_options_array,
         'debug_bootloader': 'bootloader' in debug,
         'bootloader_ignore_signals': bootloader_ignore_signals,
@@ -788,7 +850,6 @@ def main(
         'upx_exclude': upx_exclude,
         'runtime_tmpdir': runtime_tmpdir,
         'exe_options': exe_options,
-        'cipher_init': cipher_init,
         # Directory with additional custom import hooks.
         'hookspath': hookspath,
         # List with custom runtime hook files.
@@ -810,9 +871,6 @@ def main(
         'codesign_identity': codesign_identity,
         # Entitlements file (macOS only)
         'entitlements_file': entitlements_file,
-        # Windows assembly searching options
-        'win_no_prefer_redirects': win_no_prefer_redirects,
-        'win_private_assemblies': win_private_assemblies,
         # splash screen
         'splash_init': splash_init,
         'splash_target': splash_target,

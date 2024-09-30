@@ -14,7 +14,6 @@ Templates to generate .spec files.
 
 onefiletmplt = """# -*- mode: python ; coding: utf-8 -*-
 %(preamble)s
-%(cipher_init)s
 
 a = Analysis(
     %(scripts)s,
@@ -26,18 +25,15 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=%(runtime_hooks)r,
     excludes=%(excludes)s,
-    win_no_prefer_redirects=%(win_no_prefer_redirects)s,
-    win_private_assemblies=%(win_private_assemblies)s,
-    cipher=block_cipher,
     noarchive=%(noarchive)s,
+    optimize=%(optimize)r,
 )
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure)
 %(splash_init)s
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
-    a.zipfiles,
     a.datas,%(splash_target)s%(splash_binaries)s
     %(options)s,
     name='%(name)s',
@@ -58,7 +54,6 @@ exe = EXE(
 
 onedirtmplt = """# -*- mode: python ; coding: utf-8 -*-
 %(preamble)s
-%(cipher_init)s
 
 a = Analysis(
     %(scripts)s,
@@ -70,12 +65,10 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=%(runtime_hooks)r,
     excludes=%(excludes)s,
-    win_no_prefer_redirects=%(win_no_prefer_redirects)s,
-    win_private_assemblies=%(win_private_assemblies)s,
-    cipher=block_cipher,
     noarchive=%(noarchive)s,
+    optimize=%(optimize)r,
 )
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure)
 %(splash_init)s
 exe = EXE(
     pyz,
@@ -97,21 +90,12 @@ exe = EXE(
 coll = COLLECT(
     exe,
     a.binaries,
-    a.zipfiles,
     a.datas,%(splash_binaries)s
     strip=%(strip)s,
     upx=%(upx)s,
     upx_exclude=%(upx_exclude)s,
     name='%(name)s',
 )
-"""
-
-cipher_absent_template = """
-block_cipher = None
-"""
-
-cipher_init_template = """
-block_cipher = pyi_crypto.PyiBlockCipher(key=%(key)r)
 """
 
 bundleexetmplt = """app = BUNDLE(

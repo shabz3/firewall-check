@@ -19,6 +19,7 @@ import codecs
 import re
 import tokenize
 import io
+import pathlib
 
 from PyInstaller import log as logging
 from PyInstaller.compat import is_win
@@ -54,21 +55,6 @@ def files_in_dir(directory, file_patterns=None):
     for file_pattern in file_patterns:
         files.extend(glob.glob(os.path.join(directory, file_pattern)))
     return files
-
-
-def get_unicode_modules():
-    """
-    Try importing modules required for unicode support in the frozen application.
-    """
-    modules = []
-    try:
-        # `codecs` depends on `encodings`, so the latter are included automatically.
-        import codecs  # noqa: F401
-        modules.append('codecs')
-    except ImportError:
-        logger.error("Cannot detect modules 'codecs'.")
-
-    return modules
 
 
 def get_path_to_toplevel_modules(filename):
@@ -129,9 +115,6 @@ def load_py_data_struct(filename):
     :return:
     """
     with open(filename, 'r', encoding='utf-8') as f:
-        # Binding redirects are stored as a named tuple, so bring the namedtuple class into scope for parsing the TOC.
-        from PyInstaller.depend.bindepend import BindingRedirect  # noqa: F401
-
         if is_win:
             # import versioninfo so that VSVersionInfo can parse correctly.
             from PyInstaller.utils.win32 import versioninfo  # noqa: F401
@@ -232,3 +215,15 @@ def is_iterable(arg):
     except TypeError:
         return False
     return True
+
+
+def path_to_parent_archive(filename):
+    """
+    Check if the given file path points to a file inside an existing archive file. Returns first path from the set of
+    parent paths that points to an existing file, or `None` if no such path exists (i.e., file is an actual stand-alone
+    file).
+    """
+    for parent in pathlib.Path(filename).parents:
+        if parent.is_file():
+            return parent
+    return None

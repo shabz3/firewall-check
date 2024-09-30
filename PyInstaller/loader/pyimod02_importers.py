@@ -19,11 +19,10 @@ PEP-302 and PEP-451 importers for frozen applications.
 
 import sys
 import os
-import pathlib
 import io
-import tokenize
 
 import _frozen_importlib
+import _thread
 
 from pyimod01_archive import ArchiveReadError, ZlibArchiveReader
 
@@ -51,13 +50,26 @@ def _decode_source(source_bytes):
     Based on CPython's implementation of the same functionality:
     https://github.com/python/cpython/blob/3.9/Lib/importlib/_bootstrap_external.py#L679-L688
     """
+    # Local import to avoid including `tokenize` and its dependencies in `base_library.zip`
+    from tokenize import detect_encoding
     source_bytes_readline = io.BytesIO(source_bytes).readline
-    encoding = tokenize.detect_encoding(source_bytes_readline)
+    encoding = detect_encoding(source_bytes_readline)
     newline_decoder = io.IncrementalNewlineDecoder(decoder=None, translate=True)
     return newline_decoder.decode(source_bytes.decode(encoding[0]))
 
 
-class FrozenImporter:
+class PyiFrozenImporterState:
+    """
+    An object encapsulating extra information for PyiFrozenImporter, to be stored in `ModuleSpec.loader_state`. Having
+    a custom type allows us to verify that module spec indeed contains the original loader state data, as set by
+    `PyiFrozenImporter.find_spec`.
+    """
+    def __init__(self, entry_name):
+        # Module name, as recorded in the PYZ archive.
+        self.pyz_entry_name = entry_name
+
+
+class PyiFrozenImporter:
     """
     Load bytecode of Python modules from the executable created by PyInstaller.
 
@@ -76,9 +88,6 @@ class FrozenImporter:
     This is also a PEP-451 finder and loader class for the ModuleSpec type import system. A PEP-451 finder requires
     method find_spec(), a PEP-451 loader requires methods exec_module(), load_module() and (optionally) create_module().
     All these methods are implemented in this one class.
-
-    To use this class just call:
-        FrozenImporter.install()
     """
     def __init__(self):
         """
@@ -86,32 +95,59 @@ class FrozenImporter:
         """
         # Examine all items in sys.path and the one like /path/executable_name?117568 is the correct executable with
         # the bundled zip archive. Use this value for the ZlibArchiveReader class, and remove this item from sys.path.
-        # It was needed only for FrozenImporter class. Wrong path from sys.path raises an ArchiveReadError exception.
+        # It was needed only for PyiFrozenImporter class. Wrong path from sys.path raises an ArchiveReadError exception.
         for pyz_filepath in sys.path:
             try:
                 # Unzip zip archive bundled with the executable.
                 self._pyz_archive = ZlibArchiveReader(pyz_filepath, check_pymagic=True)
-                # Verify the integrity of the zip archive with Python modules.
-                # This is already done when creating the ZlibArchiveReader instance.
-                #self._pyz_archive.checkmagic()
 
-                # As no Exception was raised, we can assume that ZlibArchiveReader was successfully loaded.
+                # As no exception was raised, we can assume that ZlibArchiveReader was successfully loaded.
                 # Let's remove 'pyz_filepath' from sys.path.
+                trace("# PyInstaller: PyiFrozenImporter(%s)", pyz_filepath)
                 sys.path.remove(pyz_filepath)
-                # Some runtime hook might need access to the list of available frozen modules. Let's make them
-                # accessible as a set().
-                self.toc = set(self._pyz_archive.toc.keys())
-                # Return - no error was raised.
-                trace("# PyInstaller: FrozenImporter(%s)", pyz_filepath)
-                return
+                break
             except IOError:
                 # Item from sys.path is not ZlibArchiveReader; let's try next one.
                 continue
             except ArchiveReadError:
                 # Item from sys.path is not ZlibArchiveReader; let's try next one.
                 continue
-        # sys.path does not contain the filename of the executable with the bundled zip archive. Raise import error.
-        raise ImportError("Cannot load frozen modules.")
+        else:
+            # sys.path does not contain the filename of the executable with the bundled zip archive. Raise import error.
+            raise ImportError("Cannot load frozen modules.")
+
+        # Some runtime hooks might need access to the list of available frozen modules. Make them accessible as a set().
+        self.toc = set(self._pyz_archive.toc.keys())
+
+        # Some runtime hooks might need to traverse available frozen package/module hierarchy to simulate filesystem.
+        # Such traversals can be efficiently implemented using a prefix tree (trie), whose computation we defer
+        # until first access.
+        self._lock = _thread.RLock()
+        self._toc_tree = None
+
+    @property
+    def toc_tree(self):
+        with self._lock:
+            if self._toc_tree is None:
+                self._toc_tree = self._build_pyz_prefix_tree()
+            return self._toc_tree
+
+    # Helper for computing PYZ prefix tree
+    def _build_pyz_prefix_tree(self):
+        tree = dict()
+        for entry_name in self.toc:
+            name_components = entry_name.split('.')
+            current = tree
+            if self._pyz_archive.is_package(entry_name):  # self.is_package() without unnecessary checks
+                # Package; create new dictionary node for its modules
+                for name_component in name_components:
+                    current = current.setdefault(name_component, {})
+            else:
+                # Module; create the leaf node (empty string)
+                for name_component in name_components[:-1]:
+                    current = current.setdefault(name_component, {})
+                current[name_components[-1]] = ''
+        return tree
 
     # Private helper
     def _is_pep420_namespace_package(self, fullname):
@@ -119,9 +155,9 @@ class FrozenImporter:
             try:
                 return self._pyz_archive.is_pep420_namespace_package(fullname)
             except Exception as e:
-                raise ImportError('Loader FrozenImporter cannot handle module ' + fullname) from e
+                raise ImportError(f'PyiFrozenImporter cannot handle module {fullname!r}') from e
         else:
-            raise ImportError('Loader FrozenImporter cannot handle module ' + fullname)
+            raise ImportError(f'PyiFrozenImporter cannot handle module {fullname!r}')
 
     #-- Optional Extensions to the PEP-302 Importer Protocol --
 
@@ -130,9 +166,9 @@ class FrozenImporter:
             try:
                 return self._pyz_archive.is_package(fullname)
             except Exception as e:
-                raise ImportError('Loader FrozenImporter cannot handle module ' + fullname) from e
+                raise ImportError(f'PyiFrozenImporter cannot handle module {fullname!r}') from e
         else:
-            raise ImportError('Loader FrozenImporter cannot handle module ' + fullname)
+            raise ImportError(f'PyiFrozenImporter cannot handle module {fullname!r}')
 
     def get_code(self, fullname):
         """
@@ -150,7 +186,7 @@ class FrozenImporter:
             # exception, which is turned into ImportError.
             return self._pyz_archive.extract(fullname)
         except Exception as e:
-            raise ImportError('Loader FrozenImporter cannot handle module ' + fullname) from e
+            raise ImportError(f'PyiFrozenImporter cannot handle module {fullname!r}') from e
 
     def get_source(self, fullname):
         """
@@ -178,24 +214,19 @@ class FrozenImporter:
 
     def get_data(self, path):
         """
-        Returns the data as a string, or raises IOError if the "file" was not found. The data is always returned as if
+        Returns the data as a string, or raises IOError if the file was not found. The data is always returned as if
         "binary" mode was used.
 
-        This method is useful for getting resources with 'pkg_resources' that are bundled with Python modules in the
-        PYZ archive.
-
         The 'path' argument is a path that can be constructed by munging module.__file__ (or pkg.__path__ items).
+
+        This assumes that the file in question was collected into frozen application bundle as a file, and is available
+        on the filesystem. Older versions of PyInstaller also supported data embedded in the PYZ archive, but that has
+        been deprecated in v6.
         """
-        assert path.startswith(SYS_PREFIX)
-        fullname = path[SYS_PREFIXLEN:]
-        if fullname in self.toc:
-            # If the file is in the archive, return this
-            return self._pyz_archive.extract(fullname)
-        else:
-            # Otherwise try to fetch it from the filesystem. Since __file__ attribute works properly, just try to open
-            # and read it.
-            with open(path, 'rb') as fp:
-                return fp.read()
+        # Try to fetch the data from the filesystem. Since __file__ attribute works properly, just try to open the file
+        # and read it.
+        with open(path, 'rb') as fp:
+            return fp.read()
 
     def get_filename(self, fullname):
         """
@@ -269,11 +300,22 @@ class FrozenImporter:
             return None
 
         if self._is_pep420_namespace_package(entry_name):
+            from importlib._bootstrap_external import _NamespacePath
             # PEP-420 namespace package; as per PEP 451, we need to return a spec with "loader" set to None
             # (a.k.a. not set)
             spec = _frozen_importlib.ModuleSpec(fullname, None, is_package=True)
             # Set submodule_search_locations, which seems to fill the __path__ attribute.
-            spec.submodule_search_locations = [os.path.dirname(self.get_filename(entry_name))]
+            # This needs to be an instance of `importlib._bootstrap_external._NamespacePath` for `importlib.resources`
+            # to work correctly with the namespace package; otherwise `importlib.resources.files()` throws an
+            # `ValueError('Invalid path')` due to this check:
+            # https://github.com/python/cpython/blob/v3.11.5/Lib/importlib/resources/readers.py#L109-L110
+            spec.submodule_search_locations = _NamespacePath(
+                entry_name,
+                [os.path.dirname(self.get_filename(entry_name))],
+                # The `path_finder` argument must be a callable with two arguments (`name` and `path`) that
+                # returns the spec - so we need to bind our `find_spec` via lambda.
+                lambda name, path: self.find_spec(name, path),
+            )
             return spec
 
         # origin has to be the filename
@@ -285,8 +327,8 @@ class FrozenImporter:
             self,
             is_package=is_pkg,
             origin=origin,
-            # Provide the entry_name for the loader to use during loading.
-            loader_state=entry_name
+            # Provide the entry_name (name of module entry in the PYZ) for the loader to use during loading.
+            loader_state=PyiFrozenImporterState(entry_name)
         )
 
         # Make the import machinery set __file__.
@@ -332,7 +374,32 @@ class FrozenImporter:
         for reloading, where some kinds of modules do not support in-place reloading.
         """
         spec = module.__spec__
-        bytecode = self.get_code(spec.loader_state)
+
+        if isinstance(spec.loader_state, PyiFrozenImporterState):
+            # Use the module name stored in the `loader_state`, which was set by our `find_spec()` implementation.
+            # This is necessary to properly resolve aliased modules; for example, `module.__spec__.name` contains
+            # `pkg_resources.extern.jaraco.text`, but the original name stored in `loader_state`, which we need
+            # to use for code look-up, is `pkg_resources._vendor.jaraco.text`.
+            module_name = spec.loader_state.pyz_entry_name
+        elif isinstance(spec.loader_state, dict):
+            # This seems to happen when `importlib.util.LazyLoader` is used, and our original `loader_state` is lost.
+            # We could use `spec.name` and hope for the best, but that will likely fail with aliased modules (see
+            # the comment in the branch above for an example).
+            #
+            # So try to reconstruct the original module name from the `origin` - which is essentially the reverse of
+            # our `get_filename()` implementation.
+            assert spec.origin.startswith(SYS_PREFIX)
+            module_name = spec.origin[SYS_PREFIXLEN:].replace(os.sep, '.')
+            if module_name.endswith('.pyc'):
+                module_name = module_name[:-4]
+            if module_name.endswith('.__init__'):
+                module_name = module_name[:-9]
+        else:
+            raise RuntimeError(f"Module's spec contains loader_state of incompatible type: {type(spec.loader_state)}")
+
+        bytecode = self.get_code(module_name)
+        if bytecode is None:
+            raise RuntimeError(f"Failed to retrieve bytecode for {spec.name!r}!")
 
         # Set by the import machinery
         assert hasattr(module, '__file__')
@@ -355,17 +422,16 @@ class FrozenImporter:
         """
         Return importlib.resource-compatible resource reader.
         """
-        return FrozenResourceReader(self, fullname)
+        return PyiFrozenResourceReader(self, fullname)
 
 
-class FrozenResourceReader:
+class PyiFrozenResourceReader:
     """
     Resource reader for importlib.resources / importlib_resources support.
 
-    Currently supports only on-disk resources (support for resources from the embedded archive is missing).
-    However, this should cover the typical use cases (access to data files), as PyInstaller collects data files onto
-    filesystem, and only .pyc modules are collected into embedded archive. One exception are resources collected from
-    zipped eggs (which end up collected into embedded archive), but those should be rare anyway.
+    Supports only on-disk resources, which should cover the typical use cases, i.e., the access to data files;
+    PyInstaller collects data files onto filesystem, and as of v6.0.0, the embedded PYZ archive is guaranteed
+    to contain only .pyc modules.
 
     When listing resources, source .py files will not be listed as they are not collected by default. Similarly,
     sub-directories that contained only .py files are not reconstructed on filesystem, so they will not be listed,
@@ -391,8 +457,10 @@ class FrozenResourceReader:
       https://github.com/python/cpython/blob/839d7893943782ee803536a47f1d4de160314f85/Lib/importlib/abc.py#L312
     """
     def __init__(self, importer, name):
+        # Local import to avoid including `pathlib` and its dependencies in `base_library.zip`
+        from pathlib import Path
         self.importer = importer
-        self.path = pathlib.Path(sys._MEIPASS).joinpath(*name.split('.'))
+        self.path = Path(sys._MEIPASS).joinpath(*name.split('.'))
 
     def open_resource(self, resource):
         return self.files().joinpath(resource).open('rb')
@@ -412,10 +480,10 @@ class FrozenResourceReader:
 
 def install():
     """
-    Install FrozenImporter class and other classes into the import machinery.
+    Install PyiFrozenImporter class into the import machinery.
 
-    This function installs the FrozenImporter class into the import machinery of the running process. The importer is
-    added to sys.meta_path. It could be added to sys.path_hooks, but sys.meta_path is processed by Python before
+    This function installs the PyiFrozenImporter class into the import machinery of the running process. The importer
+    is added to sys.meta_path. It could be added to sys.path_hooks, but sys.meta_path is processed by Python before
     looking at sys.path!
 
     The order of processing import hooks in sys.meta_path:
@@ -426,8 +494,8 @@ def install():
     4. Modules from sys.path
     """
     # Ensure Python looks in the bundled zip archive for modules before any other places.
-    fimp = FrozenImporter()
-    sys.meta_path.append(fimp)
+    importer = PyiFrozenImporter()
+    sys.meta_path.append(importer)
 
     # On Windows there is importer _frozen_importlib.WindowsRegistryFinder that looks for Python modules in Windows
     # registry. The frozen executable should not look for anything in the Windows registry. Remove this importer
@@ -440,18 +508,69 @@ def install():
     # importer as it uses extension names like 'module.submodle.so' (instead of paths). As of Python 3.7.0b2, there
     # are several PathFinder instances (and duplicate ones) on sys.meta_path. This propobly is a bug, see
     # https://bugs.python.org/issue33128. Thus we need to move all of them to the end, and eliminate the duplicates.
-    pathFinders = []
+    path_finders = []
     for item in reversed(sys.meta_path):
         if getattr(item, '__name__', None) == 'PathFinder':
             sys.meta_path.remove(item)
-            if item not in pathFinders:
-                pathFinders.append(item)
-    sys.meta_path.extend(reversed(pathFinders))
+            if item not in path_finders:
+                path_finders.append(item)
+    sys.meta_path.extend(reversed(path_finders))
     # TODO: do we need _frozen_importlib.FrozenImporter in Python 3? Could it be also removed?
 
     # Set the FrozenImporter as loader for __main__, in order for python to treat __main__ as a module instead of
     # a built-in.
     try:
-        sys.modules['__main__'].__loader__ = fimp
+        sys.modules['__main__'].__loader__ = importer
     except Exception:
         pass
+
+    # Apply hack for python >= 3.11 and its frozen stdlib modules.
+    if sys.version_info >= (3, 11):
+        _fixup_frozen_stdlib()
+
+
+# A hack for python >= 3.11 and its frozen stdlib modules. Unless `sys._stdlib_dir` is set, these modules end up
+# missing __file__ attribute, which causes problems with 3rd party code. At the time of writing, python interpreter
+# configuration API does not allow us to influence `sys._stdlib_dir` - it always resets it to `None`. Therefore,
+# we manually set the path, and fix __file__ attribute on modules.
+def _fixup_frozen_stdlib():
+    import _imp  # built-in
+
+    # If sys._stdlib_dir is None or empty, override it with sys._MEIPASS
+    if not sys._stdlib_dir:
+        try:
+            sys._stdlib_dir = sys._MEIPASS
+        except AttributeError:
+            pass
+
+    # The sys._stdlib_dir set above should affect newly-imported python-frozen modules. However, most of them have
+    # been already imported during python initialization and our bootstrap, so we need to retroactively fix their
+    # __file__ attribute.
+    for module_name, module in sys.modules.items():
+        if not _imp.is_frozen(module_name):
+            continue
+
+        is_pkg = _imp.is_frozen_package(module_name)
+
+        # Determine "real" name from __spec__.loader_state.
+        loader_state = module.__spec__.loader_state
+
+        orig_name = loader_state.origname
+        if is_pkg:
+            orig_name += '.__init__'
+
+        # We set suffix to .pyc to be consistent with out PyiFrozenImporter.
+        filename = os.path.join(sys._MEIPASS, *orig_name.split('.')) + '.pyc'
+
+        # Fixup the __file__ attribute
+        if not hasattr(module, '__file__'):
+            try:
+                module.__file__ = filename
+            except AttributeError:
+                pass
+
+        # Fixup the loader_state.filename
+        # Except for _frozen_importlib (importlib._bootstrap), whose loader_state.filename appears to be left at
+        # None in python.
+        if loader_state.filename is None and orig_name != 'importlib._bootstrap':
+            loader_state.filename = filename

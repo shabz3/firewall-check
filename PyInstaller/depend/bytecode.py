@@ -91,17 +91,7 @@ def finditer(pattern: Pattern, string: bytes):
 # themselves need to be enclosed in another (non-capturing) group. E.g., "(?:(?:_OPCODES_FUNCTION_GLOBAL).)".
 # NOTE2: _OPCODES_EXTENDED_ARG2 is an exception, as it is used as a list of opcodes to exclude, i.e.,
 # "[^_OPCODES_EXTENDED_ARG2]". Therefore, multiple opcodes are not separated by the OR operator.
-if not compat.is_py37:
-    _OPCODES_EXTENDED_ARG = rb"`EXTENDED_ARG`"
-    _OPCODES_EXTENDED_ARG2 = _OPCODES_EXTENDED_ARG
-    _OPCODES_FUNCTION_GLOBAL = rb"`LOAD_NAME`|`LOAD_GLOBAL`|`LOAD_FAST`"
-    _OPCODES_FUNCTION_LOAD = rb"`LOAD_ATTR`"
-    _OPCODES_FUNCTION_ARGS = rb"`LOAD_CONST`"
-    _OPCODES_FUNCTION_CALL = rb"`CALL_FUNCTION`|`CALL_FUNCTION_EX`"
-
-    def _cleanup_bytecode_string(bytecode):
-        return bytecode  # Nothing to do here
-elif not compat.is_py311:
+if not compat.is_py311:
     # Python 3.7 introduced two new function-related opcodes, LOAD_METHOD and CALL_METHOD
     _OPCODES_EXTENDED_ARG = rb"`EXTENDED_ARG`"
     _OPCODES_EXTENDED_ARG2 = _OPCODES_EXTENDED_ARG
@@ -112,7 +102,7 @@ elif not compat.is_py311:
 
     def _cleanup_bytecode_string(bytecode):
         return bytecode  # Nothing to do here
-else:
+elif not compat.is_py312:
     # Python 3.11 removed CALL_FUNCTION and CALL_METHOD, and replaced them with PRECALL + CALL instruction sequence.
     # As both PRECALL and CALL have the same parameter (the argument count), we need to match only up to the PRECALL.
     # The CALL_FUNCTION_EX is still present.
@@ -127,6 +117,21 @@ else:
     # Starting with python 3.11, the bytecode is peppered with CACHE instructions (which dis module conveniently hides
     # unless show_caches=True is used). Dealing with these CACHE instructions in regex rules is going to render them
     # unreadable, so instead we pre-process the bytecode and filter the offending opcodes out.
+    _cache_instruction_filter = bytecode_regex(rb"(`CACHE`.)|(..)")
+
+    def _cleanup_bytecode_string(bytecode):
+        return _cache_instruction_filter.sub(rb"\2", bytecode)
+
+else:
+    # Python 3.12 merged EXTENDED_ARG_QUICK back in to EXTENDED_ARG, and LOAD_METHOD in to LOAD_ATTR
+    # PRECALL is no longer a valid key
+    _OPCODES_EXTENDED_ARG = rb"`EXTENDED_ARG`"
+    _OPCODES_EXTENDED_ARG2 = _OPCODES_EXTENDED_ARG
+    _OPCODES_FUNCTION_GLOBAL = rb"`LOAD_NAME`|`LOAD_GLOBAL`|`LOAD_FAST`"
+    _OPCODES_FUNCTION_LOAD = rb"`LOAD_ATTR`"
+    _OPCODES_FUNCTION_ARGS = rb"`LOAD_CONST`"
+    _OPCODES_FUNCTION_CALL = rb"`CALL`|`CALL_FUNCTION_EX`"
+
     _cache_instruction_filter = bytecode_regex(rb"(`CACHE`.)|(..)")
 
     def _cleanup_bytecode_string(bytecode):
@@ -215,9 +220,13 @@ def load(raw: bytes, code: CodeType) -> str:
         # Then this is a literal.
         return code.co_consts[index]
     # Otherwise, it is a global name.
-    if raw[-2] == opmap["LOAD_GLOBAL"] and compat.is_py311:
+    if compat.is_py311 and raw[-2] == opmap["LOAD_GLOBAL"]:
         # In python 3.11, namei>>1 is pushed on stack...
         return code.co_names[index >> 1]
+    if compat.is_py312 and raw[-2] == opmap["LOAD_ATTR"]:
+        # In python 3.12, namei>>1 is pushed on stack...
+        return code.co_names[index >> 1]
+
     return code.co_names[index]
 
 
