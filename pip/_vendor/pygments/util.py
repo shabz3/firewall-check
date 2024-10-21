@@ -1,3 +1,16 @@
+"""
+    pygments.util
+    ~~~~~~~~~~~~~
+
+    Utility functions.
+
+    :copyright: Copyright 2006-2024 by the Pygments team, see AUTHORS.
+    :license: BSD, see LICENSE for details.
+"""
+
+import re
+from io import TextIOWrapper
+
 
 split_path_re = re.compile(r'[/\\ ]')
 doctype_lookup_re = re.compile(r'''
@@ -13,14 +26,4 @@ tag_re = re.compile(r'<(.+?)(\s.*?)?>.*?</.+?>',
                     re.IGNORECASE | re.DOTALL | re.MULTILINE)
 xml_decl_re = re.compile(r'\s*<\?xml[^>]*\?>', re.I)
 
-
-class ClassNotFound(ValueError):
-    """Raised if one of the lookup functions didn't find a matching class."""
-
-
-class OptionError(Exception):
-    """
-    This exception will be raised by all option processing functions if
-    the type or value of the argument is not correct.
-    """
 
