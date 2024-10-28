@@ -384,3 +384,70 @@
   grestore
 } bind def
 
+% -----------------------------------------------------------------------
+%
+/Helvetica-Bold findfont 20 scalefont /TitleFont exch def
+
+/FontSize 10 def
+/Helvetica-Narrow findfont FontSize scalefont /LegendFont exch def
+
+/blockshow {	% like "show" but '\n' causes new-line
+  dup = flush	%DEBUG
+  currentpoint /showY exch def /showX exch def
+  {
+    dup 10 ne
+    { 1 string dup 0 4 -1 roll put show }
+    { pop showX showY FontSize sub dup /showY exch def moveto }
+    ifelse
+  } forall
+} bind def
+
+/TX 013 def	% Title left X
+/SX 036 def
+/XA 060 def
+/XB XA SX 1.5 mul add def
+/XC XA SX 3.0 mul add def
+/XD XA SX 4.5 mul add def
+/XE XA SX 6.0 mul add def
+/XF XA SX 7.5 mul add def
+/XG XA SX 9.0 mul add def
+/XH XA SX 10.5 mul add def
+/XI XA SX 12.0 mul add def
+/XJ XA SX 13.5 mul add def
+
+/BY 036 def	% Bottom Title Top line
+/SY 037 def
+/YA 050 def
+/YB YA SY 1.8 mul add def
+/YC YA SY 3.6 mul add def
+/YD YA SY 5.4 mul add def
+/YE YA SY 7.2 mul add def
+/YF YA SY 9.0 mul add def
+/YG YA SY 10.8 mul add def
+/YH YA SY 12.6 mul add def
+/YI YA SY 14.4 mul add def
+/YJ YA SY 16.2 mul add def
+/YK YA SY 18.0 mul add def
+
+% -----------------------------------------------------------------------
+%
+%     Utility procedures to support storing 4 and 12 bit elements in
+%     strings.
+%
+%     <string> <index> <value> put##bit -
+%
+%     <index> will have a fractional part ( .5 ) if the element
+%     starts on a 4-bit boundary.
+%
+%     <value> is between 0 and 1 and is scaled 0 to 15 (4bit) or
+%     0 to 4095 (12 bit)
+
+/put4bit {
+  15 mul cvi
+  exch dup cvi dup 3 1 roll eq 3 -1 roll exch
+  { % integer index means high nibble.
+    16 mul put
+  }
+  { % low nibble -- combine with high nibble
+    2 index 2 index get or put
+  }
