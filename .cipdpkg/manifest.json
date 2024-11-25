@@ -1,0 +1,6 @@
+{
+  "format_version": "1.1",
+  "package_name": "infra/tools/luci/vpython3/linux-amd64",
+  "version_file": ".versions/vpython3.cipd_version",
+  "install_mode": "copy"
+}
